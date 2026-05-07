@@ -121,6 +121,8 @@ data:
           maxHashCacheSize: 50000
       - name: kvcache-aware
         args:
+          # The default block size of vllm is 16, keep in line with it.
+          # Changes as needed.
           blockSizeToHash: 16
           maxBlocksToMatch: 128
       plugins:

@@ -103,7 +103,7 @@ spec:
     workers:
       - type: server
         image: vllm/vllm-openai:latest
-        replicase: 1
+        replicas: 1
         pods: 1
         resources:
           limits:
