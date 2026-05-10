@@ -21,6 +21,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math/rand"
+	"strings"
 	"time"
 
 	"github.com/volcano-sh/kthena/pkg/kthena-router/common"
@@ -29,8 +30,7 @@ import (
 )
 
 type TokenizerManagerConfig struct {
-	EnableVLLMRemote bool
-	EndpointTemplate string
+	EndpointTemplates map[string]string
 }
 
 type TokenizerManager struct {
@@ -62,10 +62,16 @@ func (m *TokenizerManager) createTokenizerFromPods(model string, pods []*datasto
 		podIdx := (startIdx + i) % len(pods)
 		podInfo := pods[podIdx]
 
-		endpoint := fmt.Sprintf(m.config.EndpointTemplate, podInfo.Pod.Status.PodIP)
+		engine := normalizeEngine(podInfo.GetEngine())
+		template, ok := m.config.EndpointTemplates[engine]
+		if !ok || template == "" {
+			klog.V(4).Infof("TokenizerManager: no endpoint template for engine %q, skipping pod %s", engine, podInfo.Pod.Name)
+			continue
+		}
+		endpoint := fmt.Sprintf(template, podInfo.Pod.Status.PodIP)
 
 		config := RemoteTokenizerConfig{
-			Engine:             "vllm",
+			Engine:             engine,
 			Endpoint:           endpoint,
 			Model:              model,
 			AddSpecialTokens:   true,
@@ -74,16 +80,26 @@ func (m *TokenizerManager) createTokenizerFromPods(model string, pods []*datasto
 
 		tok, err := NewRemoteTokenizer(config)
 		if err != nil {
-			klog.Warningf("Failed to create vLLM tokenizer for model %s at endpoint %s: %v", model, endpoint, err)
+			klog.Warningf("Failed to create %s tokenizer for model %s at %s: %v", engine, model, endpoint, err)
 			continue
 		}
 
-		klog.V(4).Infof("TokenizerManager: successfully created tokenizer for model %s at endpoint %s", model, endpoint)
+		klog.V(4).Infof("TokenizerManager: created %s tokenizer for model %s at %s", engine, model, endpoint)
 		return tok
 	}
 
 	klog.Warningf("Failed to create tokenizer for model %s after trying %d pods", model, len(pods))
 	return nil
+}
+
+// Unknown engines fall back to vLLM.
+func normalizeEngine(engine string) string {
+	switch strings.ToLower(engine) {
+	case EngineSGLang:
+		return EngineSGLang
+	default:
+		return EngineVLLM
+	}
 }
 
 // TokenizePrompt tokenizes a prompt (text or chat messages) and returns uint32 tokens

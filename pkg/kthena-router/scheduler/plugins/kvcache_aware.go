@@ -126,8 +126,10 @@ func NewKVCacheAware(pluginArg runtime.RawExtension) *KVCacheAware {
 	klog.Infof("KVCacheAware: config blockSizeToHash=%d, maxBlocksToMatch=%d", blockSizeToHash, maxBlocksToMatch)
 
 	managerConfig := tokenization.TokenizerManagerConfig{
-		EnableVLLMRemote: true,
-		EndpointTemplate: "http://%s:8000",
+		EndpointTemplates: map[string]string{
+			tokenization.EngineVLLM:   "http://%s:8000",
+			tokenization.EngineSGLang: "http://%s:30000",
+		},
 	}
 	manager := tokenization.NewTokenizerManager(managerConfig)
 
