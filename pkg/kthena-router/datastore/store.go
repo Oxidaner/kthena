@@ -233,6 +233,10 @@ type Store interface {
 	GetHTTPRoutesByGateway(gatewayKey string) []*gatewayv1.HTTPRoute
 	GetModelRoutesByGateway(gatewayKey string) []*aiv1alpha1.ModelRoute
 
+	// GetModelNames returns all model names registered via ModelRoutes,
+	// including both base model names and LoRA adapter names.
+	GetModelNames() []string
+
 	// Debug interface methods
 	GetAllModelRoutes() map[string]*aiv1alpha1.ModelRoute
 	GetAllModelServers() map[types.NamespacedName]*aiv1alpha1.ModelServer
@@ -1481,6 +1485,28 @@ func (s *store) GetAllModelRoutes() map[string]*aiv1alpha1.ModelRoute {
 		}
 	}
 	return result
+}
+
+// GetModelNames returns all model names registered via ModelRoutes,
+// including both base model names and LoRA adapter names.
+func (s *store) GetModelNames() []string {
+	s.routeMutex.RLock()
+	defer s.routeMutex.RUnlock()
+
+	seen := make(map[string]struct{})
+	for name := range s.routes {
+		seen[name] = struct{}{}
+	}
+	for name := range s.loraRoutes {
+		seen[name] = struct{}{}
+	}
+
+	names := make([]string, 0, len(seen))
+	for name := range seen {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // GetAllModelServers returns all ModelServers in the store

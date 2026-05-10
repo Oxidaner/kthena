@@ -203,6 +203,13 @@ type ModelRequest map[string]interface{}
 
 func (r *Router) HandlerFunc() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		// Handle /v1/models endpoint (OpenAI-compatible model listing)
+		if c.Request.Method == http.MethodGet &&
+			(c.Request.URL.Path == "/v1/models" || c.Request.URL.Path == "/models") {
+			r.ListModelsHandlerFunc()(c)
+			return
+		}
+
 		// Step 1: Parse and validate request
 		modelRequest, err := ParseModelRequest(c)
 		if err != nil {
@@ -808,6 +815,41 @@ func (r *Router) GetModelServer(modelName string, req *http.Request) (*v1alpha1.
 	}
 
 	return modelServer, nil
+}
+
+// ListModelsHandlerFunc returns a handler that implements the OpenAI-compatible
+// GET /v1/models endpoint. It returns all model names registered via ModelRoutes.
+func (r *Router) ListModelsHandlerFunc() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		modelNames := r.store.GetModelNames()
+
+		type modelObject struct {
+			ID      string `json:"id"`
+			Object  string `json:"object"`
+			Created int64  `json:"created"`
+			OwnedBy string `json:"owned_by"`
+		}
+
+		type modelsResponse struct {
+			Object string        `json:"object"`
+			Data   []modelObject `json:"data"`
+		}
+
+		data := make([]modelObject, 0, len(modelNames))
+		for _, name := range modelNames {
+			data = append(data, modelObject{
+				ID:      name,
+				Object:  "model",
+				Created: 0,
+				OwnedBy: "kthena",
+			})
+		}
+
+		c.JSON(http.StatusOK, modelsResponse{
+			Object: "list",
+			Data:   data,
+		})
+	}
 }
 
 func (r *Router) Auth() gin.HandlerFunc {

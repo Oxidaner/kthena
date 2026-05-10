@@ -326,6 +326,14 @@ func (m *MockStore) GetAllInferencePools() []*inferencev1.InferencePool {
 	return args.Get(0).([]*inferencev1.InferencePool)
 }
 
+func (m *MockStore) GetModelNames() []string {
+	args := m.Called()
+	if args.Get(0) == nil {
+		return nil
+	}
+	return args.Get(0).([]string)
+}
+
 func newTestContext(params gin.Params) (*gin.Context, *httptest.ResponseRecorder) {
 	w := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(w)

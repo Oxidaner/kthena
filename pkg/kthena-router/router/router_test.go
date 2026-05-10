@@ -539,6 +539,97 @@ func TestProxy_RetryBodyNotDrained(t *testing.T) {
 	}
 }
 
+func TestRouter_HandlerFunc_ListModels(t *testing.T) {
+	router, store, backend := setupTestRouter(t, nil)
+	defer backend.Close()
+
+	backendURL, _ := url.Parse(backend.URL)
+	backendIP := backendURL.Hostname()
+	backendPort, _ := strconv.Atoi(backendURL.Port())
+
+	modelServer := &aiv1alpha1.ModelServer{
+		ObjectMeta: v1.ObjectMeta{Name: "ms-1", Namespace: "default"},
+		Spec: aiv1alpha1.ModelServerSpec{
+			Model:        func(s string) *string { return &s }("base-model"),
+			WorkloadPort: aiv1alpha1.WorkloadPort{Port: int32(backendPort)},
+		},
+	}
+	pod1 := &corev1.Pod{
+		ObjectMeta: v1.ObjectMeta{Name: "pod-1", Namespace: "default"},
+		Status:     corev1.PodStatus{PodIP: backendIP, Phase: corev1.PodRunning},
+	}
+	modelRoute1 := &aiv1alpha1.ModelRoute{
+		ObjectMeta: v1.ObjectMeta{Name: "mr-1", Namespace: "default"},
+		Spec: aiv1alpha1.ModelRouteSpec{
+			ModelName: "model-alpha",
+			Rules: []*aiv1alpha1.Rule{
+				{TargetModels: []*aiv1alpha1.TargetModel{{ModelServerName: "ms-1"}}},
+			},
+		},
+	}
+	modelRoute2 := &aiv1alpha1.ModelRoute{
+		ObjectMeta: v1.ObjectMeta{Name: "mr-2", Namespace: "default"},
+		Spec: aiv1alpha1.ModelRouteSpec{
+			ModelName: "model-beta",
+			Rules: []*aiv1alpha1.Rule{
+				{TargetModels: []*aiv1alpha1.TargetModel{{ModelServerName: "ms-1"}}},
+			},
+		},
+	}
+
+	store.AddOrUpdateModelServer(modelServer, sets.New(types.NamespacedName{Name: "pod-1", Namespace: "default"}))
+	store.AddOrUpdatePod(pod1, []*aiv1alpha1.ModelServer{modelServer})
+	store.AddOrUpdateModelRoute(modelRoute1)
+	store.AddOrUpdateModelRoute(modelRoute2)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request, _ = http.NewRequest("GET", "/v1/models", nil)
+
+	router.HandlerFunc()(c)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var resp struct {
+		Object string `json:"object"`
+		Data   []struct {
+			ID      string `json:"id"`
+			Object  string `json:"object"`
+			OwnedBy string `json:"owned_by"`
+		} `json:"data"`
+	}
+	err := json.Unmarshal(w.Body.Bytes(), &resp)
+	assert.NoError(t, err)
+	assert.Equal(t, "list", resp.Object)
+	assert.Len(t, resp.Data, 2)
+	assert.Equal(t, "model-alpha", resp.Data[0].ID)
+	assert.Equal(t, "model-beta", resp.Data[1].ID)
+	assert.Equal(t, "model", resp.Data[0].Object)
+	assert.Equal(t, "kthena", resp.Data[0].OwnedBy)
+}
+
+func TestRouter_HandlerFunc_ListModels_Empty(t *testing.T) {
+	router, _, backend := setupTestRouter(t, nil)
+	defer backend.Close()
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request, _ = http.NewRequest("GET", "/v1/models", nil)
+
+	router.HandlerFunc()(c)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var resp struct {
+		Object string        `json:"object"`
+		Data   []interface{} `json:"data"`
+	}
+	err := json.Unmarshal(w.Body.Bytes(), &resp)
+	assert.NoError(t, err)
+	assert.Equal(t, "list", resp.Object)
+	assert.Empty(t, resp.Data)
+}
+
 // Helper function to parse boolean (same logic as strconv.ParseBool but simpler for test)
 func parseBool(str string) (bool, error) {
 	switch str {
