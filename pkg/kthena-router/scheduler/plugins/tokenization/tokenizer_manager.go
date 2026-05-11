@@ -65,7 +65,7 @@ func (m *TokenizerManager) createTokenizerFromPods(model string, pods []*datasto
 		engine := normalizeEngine(podInfo.GetEngine())
 		template, ok := m.config.EndpointTemplates[engine]
 		if !ok || template == "" {
-			klog.V(4).Infof("TokenizerManager: no endpoint template for engine %q, skipping pod %s", engine, podInfo.Pod.Name)
+			klog.Warningf("TokenizerManager: no endpoint template for engine %q, skipping pod %s", engine, podInfo.Pod.Name)
 			continue
 		}
 		endpoint := fmt.Sprintf(template, podInfo.Pod.Status.PodIP)
@@ -97,7 +97,13 @@ func normalizeEngine(engine string) string {
 	switch strings.ToLower(engine) {
 	case EngineSGLang:
 		return EngineSGLang
+	case EngineVLLM:
+		return EngineVLLM
+	case "":
+		klog.Warningf("TokenizerManager: empty engine string, defaulting to vLLM")
+		return EngineVLLM
 	default:
+		klog.Warningf("TokenizerManager: unknown inference engine %q, defaulting to vLLM", engine)
 		return EngineVLLM
 	}
 }

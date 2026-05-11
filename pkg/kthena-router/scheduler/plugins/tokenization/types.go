@@ -88,9 +88,14 @@ type sglangTokenizeCompletionRequest struct {
 }
 
 type sglangTokenizeChatRequest struct {
-	Model            string           `json:"model,omitempty"`
-	Messages         []common.Message `json:"messages"`
-	AddSpecialTokens *bool            `json:"add_special_tokens,omitempty"`
+	Model                string                 `json:"model,omitempty"`
+	Messages             []common.Message       `json:"messages"`
+	AddSpecialTokens     *bool                  `json:"add_special_tokens,omitempty"`
+	Tools                []interface{}          `json:"tools,omitempty"`
+	ToolChoice           interface{}            `json:"tool_choice,omitempty"`
+	ReasoningEffort      *string                `json:"reasoning_effort,omitempty"`
+	ContinueFinalMessage *bool                  `json:"continue_final_message,omitempty"`
+	ChatTemplateKwargs   map[string]interface{} `json:"chat_template_kwargs,omitempty"`
 }
 
 type sglangTokenizeResponse struct {
