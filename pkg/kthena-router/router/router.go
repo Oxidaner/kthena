@@ -716,6 +716,9 @@ func (r *Router) proxy(
 
 		if err != nil {
 			klog.Errorf(" pod request error: %v", err)
+			if c.Writer.Written() {
+				return err
+			}
 			continue
 		}
 		// record in prefix cache
@@ -845,6 +848,7 @@ func proxyRequest(
 		// Stream response: read and forward each event (line) one by one, and parse usage if present
 		c.Status(resp.StatusCode)
 		reader := bufio.NewReader(resp.Body)
+		var streamErr error
 		c.Stream(func(w io.Writer) bool {
 			line, err := reader.ReadBytes('\n')
 			if len(line) > 0 {
@@ -869,11 +873,13 @@ func proxyRequest(
 			if err != nil {
 				if err != io.EOF {
 					klog.Errorf("error reading stream body: %v", err)
+					streamErr = err
 				}
 				return false
 			}
 			return true
 		})
+		return streamErr
 	} else {
 		// Non-stream: efficiently stream response while capturing for parsing
 		var buf bytes.Buffer
@@ -882,7 +888,7 @@ func proxyRequest(
 		_, err := io.Copy(c.Writer, ttee)
 		if err != nil {
 			klog.Errorf("copy response to downstream failed: %v", err)
-			return nil
+			return err
 		}
 
 		// Parse usage if present
