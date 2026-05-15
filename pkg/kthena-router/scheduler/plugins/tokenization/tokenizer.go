@@ -33,8 +33,10 @@ func NewRemoteTokenizer(config RemoteTokenizerConfig) (Tokenizer, error) {
 	switch strings.ToLower(config.Engine) {
 	case EngineSGLang:
 		adapter = newSGLangAdapter(config.Model)
-	case EngineVLLM, "":
+	case EngineVLLM:
 		adapter = newVLLMAdapter(config.Model)
+	case "":
+		return nil, ErrInvalidConfig{Message: "empty engine string"}
 	default:
 		return nil, ErrInvalidConfig{Message: fmt.Sprintf("unsupported engine: %q", config.Engine)}
 	}

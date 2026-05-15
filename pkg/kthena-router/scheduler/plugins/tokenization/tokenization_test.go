@@ -73,7 +73,10 @@ func TestIntToByteArray(t *testing.T) {
 // Test TokenizerManager
 func TestTokenizerManager(t *testing.T) {
 	config := TokenizerManagerConfig{
-		EndpointTemplates: map[string]string{EngineVLLM: "http://%s:8000"},
+		EndpointTemplates: map[string]string{
+			EngineVLLM:   "http://%s:8000",
+			EngineSGLang: "http://%s:30000",
+		},
 	}
 
 	manager := NewTokenizerManager(config)
@@ -366,20 +369,34 @@ func TestNormalizeEngine(t *testing.T) {
 	tests := []struct {
 		input    string
 		expected string
+		wantErr  bool
 	}{
-		{"vLLM", EngineVLLM},
-		{"vllm", EngineVLLM},
-		{"VLLM", EngineVLLM},
-		{"SGLang", EngineSGLang},
-		{"sglang", EngineSGLang},
-		{"SGLANG", EngineSGLang},
-		{"", EngineVLLM},
-		{"unknown", EngineVLLM},
+		{"vLLM", EngineVLLM, false},
+		{"vllm", EngineVLLM, false},
+		{"VLLM", EngineVLLM, false},
+		{"SGLang", EngineSGLang, false},
+		{"sglang", EngineSGLang, false},
+		{"SGLANG", EngineSGLang, false},
+		{"", "", true},
+		{"unknown", "", true},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.input, func(t *testing.T) {
-			if got := normalizeEngine(tt.input); got != tt.expected {
+			got, err := normalizeEngine(tt.input)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("normalizeEngine(%q) expected error, got nil", tt.input)
+				}
+				if _, ok := err.(ErrInvalidConfig); !ok {
+					t.Fatalf("normalizeEngine(%q) expected ErrInvalidConfig, got %T: %v", tt.input, err, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("normalizeEngine(%q) unexpected error: %v", tt.input, err)
+			}
+			if got != tt.expected {
 				t.Errorf("normalizeEngine(%q) = %q, want %q", tt.input, got, tt.expected)
 			}
 		})
@@ -403,7 +420,7 @@ func TestNewRemoteTokenizerEngineDispatch(t *testing.T) {
 	}{
 		{name: "vllm explicit", engine: "vllm", want: wantVLLM},
 		{name: "vllm uppercase", engine: "VLLM", want: wantVLLM},
-		{name: "default (empty)", engine: "", want: wantVLLM},
+		{name: "default (empty)", engine: "", want: wantError},
 		{name: "sglang", engine: "sglang", want: wantSGLang},
 		{name: "sglang mixed case", engine: "SGLang", want: wantSGLang},
 		{name: "unsupported", engine: "tgi", want: wantError},
