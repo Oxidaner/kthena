@@ -1769,6 +1769,7 @@ func TestRouterConfigUpdateShared(t *testing.T, testCtx *routercontext.RouterTes
 	restartedMetricsURL := fmt.Sprintf("http://127.0.0.1:%s/metrics", restartedRouterPort)
 
 	// Verify routing works after config update and restart.
+	WaitForKthenaRouterValidatingWebhook(t, ctx, testCtx.KthenaClient, kthenaNamespace)
 	t.Run("VerifyUpdatedConfig", func(t *testing.T) {
 		resp := utils.CheckChatCompletionsWithURL(t, restartedRouterURL, modelRoute.Spec.ModelName, messages)
 		assert.Equal(t, 200, resp.StatusCode, "Routing should work after config update and restart")

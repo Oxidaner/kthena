@@ -34,7 +34,12 @@ import (
 
 // waitForKthenaRouterValidatingWebhook polls until a DryRun ModelRoute create reaches the
 // validating webhook (avoids flaky tests while cert-manager / deployment finishes).
-func waitForKthenaRouterValidatingWebhook(t *testing.T, ctx context.Context, kthenaClient *clientset.Clientset, namespace string) {
+//
+// The validating webhook is served by the kthena-router pod itself, not a separate
+// deployment. TestRouterConfigUpdate deliberately restarts the kthena-router pod before
+// this test runs. Kubernetes can mark the pod Ready before the webhook handler is fully
+// initialised, so we retry all transient connection errors until the webhook is stable.
+func WaitForKthenaRouterValidatingWebhook(t *testing.T, ctx context.Context, kthenaClient *clientset.Clientset, namespace string) {
 	t.Helper()
 	t.Log("Waiting for kthena-router validating webhook to accept requests")
 
@@ -63,9 +68,17 @@ func waitForKthenaRouterValidatingWebhook(t *testing.T, ctx context.Context, kth
 		_, err := kthenaClient.NetworkingV1alpha1().ModelRoutes(namespace).Create(ctx, probe, metav1.CreateOptions{DryRun: []string{"All"}})
 		if err != nil {
 			errStr := err.Error()
+			// CHANGE 1: added EOF, connection reset by peer, no endpoints available.
+			// EOF is the primary failure mode — the router pod accepts the TCP
+			// connection but drops it mid-TLS handshake during partial startup after
+			// TestRouterConfigUpdate restarts the pod. Without EOF here the test
+			// dies instantly with no retry on the most common failure case.
 			if strings.Contains(errStr, "connect: connection refused") ||
 				strings.Contains(errStr, "i/o timeout") ||
-				strings.Contains(errStr, "context deadline exceeded") {
+				strings.Contains(errStr, "context deadline exceeded") ||
+				strings.Contains(errStr, "EOF") ||
+				strings.Contains(errStr, "connection reset by peer") ||
+				strings.Contains(errStr, "no endpoints available") {
 				t.Logf("Router validating webhook not ready yet, retrying: %v", err)
 				return false, nil
 			}
@@ -81,7 +94,7 @@ func waitForKthenaRouterValidatingWebhook(t *testing.T, ctx context.Context, kth
 // Invalid case uses an empty string in loraAdapters (CRD CEL allows non-empty list; webhook rejects item).
 func TestKthenaRouterValidatingWebhook(t *testing.T) {
 	ctx := context.Background()
-	waitForKthenaRouterValidatingWebhook(t, ctx, testCtx.KthenaClient, testNamespace)
+	WaitForKthenaRouterValidatingWebhook(t, ctx, testCtx.KthenaClient, testNamespace)
 
 	weight100 := uint32(100)
 	validRoute := &networkingv1alpha1.ModelRoute{
