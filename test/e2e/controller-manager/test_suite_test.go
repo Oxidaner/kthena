@@ -89,6 +89,11 @@ func TestMain(m *testing.M) {
 func setupControllerManagerE2ETest(t *testing.T) (context.Context, *clientset.Clientset, *kubernetes.Clientset) {
 	t.Helper()
 	ctx := context.Background()
+	if deadline, ok := t.Deadline(); ok {
+		ctxWithDeadline, cancel := context.WithDeadline(ctx, deadline)
+		t.Cleanup(cancel)
+		ctx = ctxWithDeadline
+	}
 	config, err := utils.GetKubeConfig()
 	require.NoError(t, err, "Failed to get kubeconfig")
 	kthenaClient, err := clientset.NewForConfig(config)
@@ -110,7 +115,9 @@ func waitForWebhookReady(t *testing.T, ctx context.Context, kthenaClient *client
 		probe.Namespace = namespace
 		probe.Name = "webhook-ready-probe-" + utils.RandomString(5)
 
-		_, err := kthenaClient.WorkloadV1alpha1().ModelBoosters(namespace).Create(ctx, probe, metav1.CreateOptions{DryRun: []string{"All"}})
+		createCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		_, err := kthenaClient.WorkloadV1alpha1().ModelBoosters(namespace).Create(createCtx, probe, metav1.CreateOptions{DryRun: []string{"All"}})
+		cancel()
 		if err != nil {
 			errStr := err.Error()
 			if strings.Contains(errStr, "connect: connection refused") {

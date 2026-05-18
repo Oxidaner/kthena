@@ -133,9 +133,11 @@ func TestModelServingLifecycle(t *testing.T) {
 
 	// Verify that associated pods are cleaned up
 	require.Eventually(t, func() bool {
-		pods, err := kubeClient.CoreV1().Pods(testNamespace).List(ctx, metav1.ListOptions{
+		listCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		pods, err := kubeClient.CoreV1().Pods(testNamespace).List(listCtx, metav1.ListOptions{
 			LabelSelector: labelSelector,
 		})
+		cancel()
 		if err != nil {
 			return false
 		}
@@ -1523,11 +1525,11 @@ func TestModelServingPartitionScaleDown(t *testing.T) {
 
 	finalMS, err := kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Get(ctx, modelServing.Name, metav1.GetOptions{})
 	require.NoError(t, err)
-	assert.Equal(t, scaledReplicas, *finalMS.Spec.Replicas)
-	assert.Equal(t, scaledReplicas, finalMS.Status.Replicas)
-	assert.Equal(t, int32(0), finalMS.Status.UpdatedReplicas)
-	assert.Equal(t, scaledReplicas, finalMS.Status.CurrentReplicas)
-	assert.Equal(t, scaledReplicas, finalMS.Status.AvailableReplicas)
+	require.Equal(t, scaledReplicas, *finalMS.Spec.Replicas)
+	require.Equal(t, scaledReplicas, finalMS.Status.Replicas)
+	require.Equal(t, int32(0), finalMS.Status.UpdatedReplicas)
+	require.Equal(t, scaledReplicas, finalMS.Status.CurrentReplicas)
+	require.Equal(t, scaledReplicas, finalMS.Status.AvailableReplicas)
 
 	t.Log("ModelServing partition scale down test passed successfully")
 }
@@ -1619,9 +1621,11 @@ type servingGroupState struct {
 }
 
 func collectRunningServingGroupStates(ctx context.Context, kubeClient *kubernetes.Clientset, msName string) (map[int32]servingGroupState, error) {
-	pods, err := kubeClient.CoreV1().Pods(testNamespace).List(ctx, metav1.ListOptions{
+	listCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	pods, err := kubeClient.CoreV1().Pods(testNamespace).List(listCtx, metav1.ListOptions{
 		LabelSelector: modelServingLabelSelector(msName),
 	})
+	cancel()
 	if err != nil {
 		return nil, err
 	}
@@ -1666,7 +1670,9 @@ func waitForPartitionState(t *testing.T, ctx context.Context, kthenaClient *clie
 
 	var updateRevision string
 	require.Eventually(t, func() bool {
-		ms, err := kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Get(ctx, msName, metav1.GetOptions{})
+		getCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		ms, err := kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Get(getCtx, msName, metav1.GetOptions{})
+		cancel()
 		if err != nil {
 			return false
 		}
@@ -1707,7 +1713,9 @@ func waitForRollingUpdateConverged(t *testing.T, ctx context.Context, kthenaClie
 
 	var finalMS *workload.ModelServing
 	require.Eventually(t, func() bool {
-		ms, err := kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Get(ctx, msName, metav1.GetOptions{})
+		getCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		ms, err := kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Get(getCtx, msName, metav1.GetOptions{})
+		cancel()
 		if err != nil {
 			return false
 		}
@@ -1763,9 +1771,11 @@ func verifyAllPodsHaveImage(t *testing.T, ctx context.Context, kubeClient *kuber
 	labelSelector, expectedImage, phase string) {
 	t.Helper()
 	require.Eventually(t, func() bool {
-		pods, err := kubeClient.CoreV1().Pods(testNamespace).List(ctx, metav1.ListOptions{
+		listCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		pods, err := kubeClient.CoreV1().Pods(testNamespace).List(listCtx, metav1.ListOptions{
 			LabelSelector: labelSelector,
 		})
+		cancel()
 		if err != nil || len(pods.Items) == 0 {
 			return false
 		}
