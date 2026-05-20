@@ -25,7 +25,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// this block tests that each serving group status maps to the correct deletion priority value.
+// This block tests that each serving group status maps to the correct deletion priority value.
 func TestGetServingGroupStatusPriority(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -72,7 +72,7 @@ func TestGetServingGroupStatusPriority(t *testing.T) {
 	}
 }
 
-// this block tests  each role status maps to the correct deletion priority value.
+// This block tests that each role status maps to the correct deletion priority value.
 func TestGetRoleStatusPriority(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -114,7 +114,7 @@ func TestGetRoleStatusPriority(t *testing.T) {
 	}
 }
 
-// tests that getPodDeletionCost correctly reads the annotation value,
+// Tests that getPodDeletionCost correctly reads the annotation value,
 // handles missing/invalid annotations, and defaults to 0.
 func TestGetPodDeletionCost(t *testing.T) {
 	c := &ModelServingController{}
@@ -185,7 +185,7 @@ func TestGetPodDeletionCost(t *testing.T) {
 	}
 }
 
-// tests that Running serving groups are always protected from deletion
+// Tests that Running serving groups are always protected from deletion
 // compared to all other statuses (Creating, Deleting, Scaling, NotFound).
 func TestRunningStatusHasLowerDeletionPriorityThanOthers(t *testing.T) {
 	runningPriority := getServingGroupStatusPriority(datastore.ServingGroupRunning)
