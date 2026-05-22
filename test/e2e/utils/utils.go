@@ -18,6 +18,7 @@ package utils
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -33,17 +34,22 @@ import (
 
 const (
 	defaultPollingInterval = 2 * time.Second
+	DefaultAPICallTimeout  = 2 * time.Second
 )
 
 // WaitForModelServingReady waits for a ModelServing to converge with desired replicas.
 func WaitForModelServingReady(t *testing.T, ctx context.Context, kthenaClient *clientset.Clientset, namespace, name string) {
 	t.Helper()
 	t.Log("Waiting for ModelServing to be ready...")
-	err := wait.PollUntilContextTimeout(ctx, 5*time.Second, 5*time.Minute, true, func(ctx context.Context) (bool, error) {
-		getCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	err := wait.PollUntilContextTimeout(ctx, defaultPollingInterval, 5*time.Minute, true, func(ctx context.Context) (bool, error) {
+		getCtx, cancel := context.WithTimeout(ctx, DefaultAPICallTimeout)
 		defer cancel()
 		ms, err := kthenaClient.WorkloadV1alpha1().ModelServings(namespace).Get(getCtx, name, metav1.GetOptions{})
 		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) || apierrors.IsTimeout(err) || apierrors.IsServerTimeout(err) {
+				t.Logf("Timeout getting ModelServing %s, retrying: %v", name, err)
+				return false, nil
+			}
 			t.Logf("Error getting ModelServing %s, retrying: %v", name, err)
 			return false, nil
 		}
@@ -54,7 +60,9 @@ func WaitForModelServingReady(t *testing.T, ctx context.Context, kthenaClient *c
 		}
 		return ms.Status.ObservedGeneration >= ms.Generation &&
 			ms.Status.Replicas == expectedReplicas &&
-			ms.Status.AvailableReplicas == expectedReplicas, nil
+			ms.Status.AvailableReplicas == expectedReplicas &&
+			ms.Status.UpdatedReplicas == expectedReplicas &&
+			ms.Status.CurrentReplicas == expectedReplicas, nil
 	})
 	require.NoError(t, err, "ModelServing did not become ready")
 }
@@ -91,11 +99,11 @@ func IsPodReady(pod corev1.Pod) bool {
 func WaitForDeploymentReady(t *testing.T, ctx context.Context, kubeClient kubernetes.Interface, namespace, name string, replicas int32, timeout time.Duration) {
 	t.Helper()
 	err := wait.PollUntilContextTimeout(ctx, defaultPollingInterval, timeout, true, func(ctx context.Context) (bool, error) {
-		getCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		getCtx, cancel := context.WithTimeout(ctx, DefaultAPICallTimeout)
 		defer cancel()
 		deploy, err := kubeClient.AppsV1().Deployments(namespace).Get(getCtx, name, metav1.GetOptions{})
 		if err != nil {
-			if apierrors.IsNotFound(err) {
+			if apierrors.IsNotFound(err) || errors.Is(err, context.DeadlineExceeded) || apierrors.IsTimeout(err) || apierrors.IsServerTimeout(err) {
 				return false, nil
 			}
 			return false, err
@@ -109,11 +117,11 @@ func WaitForDeploymentReady(t *testing.T, ctx context.Context, kubeClient kubern
 // It polls until ReadyReplicas == *Spec.Replicas, or until ReadyReplicas >= 1 when Spec.Replicas is nil.
 func WaitForDeploymentReadyE(ctx context.Context, kubeClient kubernetes.Interface, namespace, name string, timeout time.Duration) error {
 	err := wait.PollUntilContextTimeout(ctx, defaultPollingInterval, timeout, true, func(ctx context.Context) (bool, error) {
-		getCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		getCtx, cancel := context.WithTimeout(ctx, DefaultAPICallTimeout)
 		defer cancel()
 		deploy, err := kubeClient.AppsV1().Deployments(namespace).Get(getCtx, name, metav1.GetOptions{})
 		if err != nil {
-			if apierrors.IsNotFound(err) {
+			if apierrors.IsNotFound(err) || errors.Is(err, context.DeadlineExceeded) || apierrors.IsTimeout(err) || apierrors.IsServerTimeout(err) {
 				return false, nil
 			}
 			return false, err
