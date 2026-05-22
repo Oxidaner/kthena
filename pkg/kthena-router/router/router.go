@@ -1125,19 +1125,24 @@ func (r *Router) proxyToPDDisaggregated(
 	return fmt.Errorf("all prefill/decode attempts failed")
 }
 
-// handleFairnessScheduling handles the fairness scheduling flow for requests
-func (r *Router) handleFairnessScheduling(c *gin.Context, modelRequest ModelRequest, requestID string, modelName string) error {
-	userIdVal, ok := c.Get(common.UserIdKey)
-	if !ok {
-		c.AbortWithStatusJSON(http.StatusBadRequest, "missing userId in request body")
-		return fmt.Errorf("missing userId in request body")
-	}
-	userId, ok := userIdVal.(string)
-	if !ok {
-		c.AbortWithStatusJSON(http.StatusBadRequest, "userId is not a string")
-		return fmt.Errorf("userId is not a string")
+func getUserID(c *gin.Context) (string, error) {
+	userIDValue, exists := c.Get(common.UserIdKey)
+	if !exists {
+		return "", fmt.Errorf("missing userId in request body")
 	}
 
+	userID, ok := userIDValue.(string)
+	if !ok {
+		return "", fmt.Errorf("userId is not a string")
+	}
+
+	return userID, nil
+}
+
+// handleFairnessScheduling handles the fairness scheduling flow for requests
+func (r *Router) handleFairnessScheduling(c *gin.Context, modelRequest ModelRequest, requestID string, modelName string) error {
+	// donot block the proxying if userId is not present, which should have been intercepted by Auth
+	userId, _ := getUserID(c)
 	// Create request-scoped context that unifies client disconnect and server timeout
 	reqCtx, cancel := context.WithTimeout(c.Request.Context(), r.fairnessTimeout)
 	defer cancel()
