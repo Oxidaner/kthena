@@ -17,6 +17,7 @@ limitations under the License.
 package controller_manager
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -96,6 +97,97 @@ func TestModelCR(t *testing.T) {
 		}
 		return false
 	}, 2*time.Minute, 5*time.Second, "ModelBooster was not deleted")
+}
+
+// TestModelBoosterSelfHealing validates that the controller instantly self-heals deleted child resources.
+func TestModelBoosterSelfHealing(t *testing.T) {
+	ctx, kthenaClient, _ := setupControllerManagerE2ETest(t)
+
+	// Create a Model CR in the test namespace
+	model := createTestModel()
+	model.Name = "self-healing-test-model"
+	model.Spec.Name = "self-healing-test-model"
+
+	createdModel, err := kthenaClient.WorkloadV1alpha1().ModelBoosters(testNamespace).Create(ctx, model, metav1.CreateOptions{})
+	require.NoError(t, err, "Failed to create Model CR")
+	assert.NotNil(t, createdModel)
+
+	t.Cleanup(func() {
+		if err := kthenaClient.WorkloadV1alpha1().ModelBoosters(testNamespace).Delete(context.Background(), model.Name, metav1.DeleteOptions{}); err != nil {
+			t.Logf("cleanup: failed to delete ModelBooster %s: %v", model.Name, err)
+		}
+	})
+
+	t.Logf("Created Model CR: %s/%s", createdModel.Namespace, createdModel.Name)
+
+	// Wait for the Model to be Active
+	require.Eventually(t, func() bool {
+		m, err := kthenaClient.WorkloadV1alpha1().ModelBoosters(testNamespace).Get(ctx, model.Name, metav1.GetOptions{})
+		if err != nil {
+			return false
+		}
+		return meta.IsStatusConditionPresentAndEqual(m.Status.Conditions,
+			string(workload.ModelStatusConditionTypeActive), metav1.ConditionTrue)
+	}, 5*time.Minute, 5*time.Second, "Model did not become Active")
+
+	t.Log("Model is active. Testing self-healing of AutoscalingPolicy...")
+
+	// Find the generated AutoscalingPolicy
+	policies, err := kthenaClient.WorkloadV1alpha1().AutoscalingPolicies(testNamespace).List(ctx, metav1.ListOptions{})
+	require.NoError(t, err)
+	var policyToDelete *workload.AutoscalingPolicy
+	for i := range policies.Items {
+		for _, owner := range policies.Items[i].OwnerReferences {
+			if owner.Name == model.Name {
+				policyToDelete = &policies.Items[i]
+				break
+			}
+		}
+	}
+	require.NotNil(t, policyToDelete, "Expected at least one AutoscalingPolicy to be generated for the model")
+
+	err = kthenaClient.WorkloadV1alpha1().AutoscalingPolicies(testNamespace).Delete(ctx, policyToDelete.Name, metav1.DeleteOptions{})
+	require.NoError(t, err, "Failed to delete AutoscalingPolicy")
+
+	// Wait for the controller to self-heal and recreate it
+	require.Eventually(t, func() bool {
+		recreated, err := kthenaClient.WorkloadV1alpha1().AutoscalingPolicies(testNamespace).Get(ctx, policyToDelete.Name, metav1.GetOptions{})
+		if err != nil {
+			return false
+		}
+		// Make sure it's a new instance (different UID)
+		return recreated.UID != policyToDelete.UID
+	}, 1*time.Minute, 2*time.Second, "Controller failed to self-heal deleted AutoscalingPolicy")
+
+	t.Log("AutoscalingPolicy was successfully self-healed. Testing ModelServing...")
+
+	// Find the generated ModelServing
+	servings, err := kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).List(ctx, metav1.ListOptions{})
+	require.NoError(t, err)
+	var servingToDelete *workload.ModelServing
+	for i := range servings.Items {
+		for _, owner := range servings.Items[i].OwnerReferences {
+			if owner.Name == model.Name {
+				servingToDelete = &servings.Items[i]
+				break
+			}
+		}
+	}
+	require.NotNil(t, servingToDelete, "Expected at least one ModelServing to be generated for the model")
+
+	err = kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Delete(ctx, servingToDelete.Name, metav1.DeleteOptions{})
+	require.NoError(t, err, "Failed to delete ModelServing")
+
+	// Wait for the controller to self-heal and recreate it
+	require.Eventually(t, func() bool {
+		recreated, err := kthenaClient.WorkloadV1alpha1().ModelServings(testNamespace).Get(ctx, servingToDelete.Name, metav1.GetOptions{})
+		if err != nil {
+			return false
+		}
+		return recreated.UID != servingToDelete.UID
+	}, 1*time.Minute, 2*time.Second, "Controller failed to self-heal deleted ModelServing")
+
+	t.Log("ModelServing was successfully self-healed. Test complete.")
 }
 
 func createValidModelBoosterForWebhookTest() *workload.ModelBooster {
