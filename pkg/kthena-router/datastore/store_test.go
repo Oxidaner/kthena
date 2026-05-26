@@ -50,9 +50,9 @@ func TestParseMetricsUpdateInterval(t *testing.T) {
 		expected time.Duration
 	}{
 		{
-			name:     "default when env not set",
+			name:     "default when env empty",
 			envValue: "",
-			expected: defaultUpdateInterval,
+			expected: defaultMetricsUpdateInterval,
 		},
 		{
 			name:     "valid duration 200ms",
@@ -72,17 +72,17 @@ func TestParseMetricsUpdateInterval(t *testing.T) {
 		{
 			name:     "invalid duration falls back to default",
 			envValue: "notaduration",
-			expected: defaultUpdateInterval,
+			expected: defaultMetricsUpdateInterval,
 		},
 		{
 			name:     "zero duration falls back to default",
 			envValue: "0s",
-			expected: defaultUpdateInterval,
+			expected: defaultMetricsUpdateInterval,
 		},
 		{
 			name:     "negative duration falls back to default",
 			envValue: "-1s",
-			expected: defaultUpdateInterval,
+			expected: defaultMetricsUpdateInterval,
 		},
 	}
 
@@ -104,7 +104,7 @@ func TestNewStoreUsesMetricsUpdateInterval(t *testing.T) {
 func TestNewStoreUsesDefaultMetricsUpdateInterval(t *testing.T) {
 	t.Setenv("METRICS_UPDATE_INTERVAL", "")
 	s := New().(*store)
-	assert.Equal(t, defaultUpdateInterval, s.metricsUpdateInterval)
+	assert.Equal(t, defaultMetricsUpdateInterval, s.metricsUpdateInterval)
 }
 
 func TestCreateFairnessQueueConfig_RejectsInvalidWeights(t *testing.T) {

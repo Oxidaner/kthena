@@ -62,10 +62,11 @@ var (
 )
 
 const (
-	// Configuration constants for fairness scheduling
-	defaultQueueQPS          = 100
-	defaultUpdateInterval    = 1 * time.Second
-	metricsUpdateIntervalEnv = "METRICS_UPDATE_INTERVAL"
+	defaultQueueQPS = 100 //nolint:unused // pre-existing constant kept for future use
+
+	// defaultMetricsUpdateInterval is the default polling interval for pod metrics.
+	defaultMetricsUpdateInterval = 1 * time.Second
+	metricsUpdateIntervalEnv     = "METRICS_UPDATE_INTERVAL"
 
 	// onFlightSyncInterval caps Redis read traffic from SyncOnFlightCounts.
 	// At most one HMGET is issued per interval regardless of request rate;
@@ -464,10 +465,10 @@ func parseMetricsUpdateInterval() time.Duration {
 		if d, err := time.ParseDuration(v); err == nil && d > 0 {
 			return d
 		} else {
-			klog.Warningf("Invalid %s: %q, using default %v", metricsUpdateIntervalEnv, v, defaultUpdateInterval)
+			klog.Warningf("Invalid %s: %q, using default %v", metricsUpdateIntervalEnv, v, defaultMetricsUpdateInterval)
 		}
 	}
-	return defaultUpdateInterval
+	return defaultMetricsUpdateInterval
 }
 
 func (s *store) Run(ctx context.Context) {
