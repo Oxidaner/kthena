@@ -54,6 +54,7 @@ E2E (requires Kind, Docker, Helm): `make test-e2e-controller-manager`, `make tes
 
 ## Coding conventions
 
+- **Make no mistakes** and follow existing codebase patterns while writing code.
 - Follow [Go Code Review Comments](https://go.dev/wiki/CodeReviewComments); use `gofmt` / `make fmt`.
 - Keep **user-facing APIs backward compatible**: CRDs, HTTP router APIs, CLI flags.
 - Put implementation in `pkg/`, not `cmd/` (thin `main` only).
