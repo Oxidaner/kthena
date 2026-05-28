@@ -995,6 +995,10 @@ func TestHandleFairnessScheduling(t *testing.T) {
 				router.store = tt.storeWrapper(store)
 			}
 
+			ctx, cancel := context.WithCancel(context.Background())
+			router.store.Run(ctx)
+			defer cancel()
+
 			w := httptest.NewRecorder()
 			c, _ := gin.CreateTestContext(w)
 			reqBody := `{"model":"fair-model","prompt":"hello fairness"}`
