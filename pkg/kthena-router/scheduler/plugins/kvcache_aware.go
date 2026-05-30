@@ -190,7 +190,7 @@ func (t *KVCacheAware) Score(ctx *framework.Context, pods []*datastore.PodInfo) 
 
 	podNames := make([]string, 0, len(pods))
 	for _, p := range pods {
-		podNames = append(podNames, p.Pod.Name)
+		podNames = append(podNames, p.GetPodNamespacedName().Name)
 	}
 	klog.V(4).Infof("KVCacheAware.Score: called for model=%q, pods=%v, promptTextLen=%d, messagesLen=%d",
 		ctx.Model, podNames, len(ctx.Prompt.Text), len(ctx.Prompt.Messages))
@@ -232,7 +232,7 @@ func (t *KVCacheAware) Score(ctx *framework.Context, pods []*datastore.PodInfo) 
 	podScores := t.calculatePodScores(blockHashes, blockToPods)
 	scoreResults := make(map[*datastore.PodInfo]int, len(podScores))
 	for _, pod := range pods {
-		podName := pod.Pod.Name
+		podName := pod.GetPodNamespacedName().Name
 		if score, exists := podScores[podName]; exists {
 			scoreResults[pod] = score
 		}

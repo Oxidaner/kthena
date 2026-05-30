@@ -29,13 +29,14 @@ import (
 
 	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
-	aiv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/networking/v1alpha1"
-	"github.com/volcano-sh/kthena/pkg/kthena-router/utils"
 	"istio.io/istio/pkg/util/sets"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+
+	aiv1alpha1 "github.com/volcano-sh/kthena/pkg/apis/networking/v1alpha1"
+	"github.com/volcano-sh/kthena/pkg/kthena-router/utils"
 )
 
 // ptr is a helper function to get pointer to a value
@@ -170,6 +171,7 @@ func TestStoreUpdatePodMetrics(t *testing.T) {
 	sum2 := float64(2)
 	count2 := uint64(2)
 	podinfo := PodInfo{
+		Pod:    &corev1.Pod{},
 		engine: "vLLM",
 		TimePerOutputToken: &dto.Histogram{
 			SampleSum:   &sum1,
@@ -1469,12 +1471,12 @@ func TestStoreMatchModelServer(t *testing.T) {
 type fakePodRuntimeInspector struct {
 	metricsFn    func(string, *corev1.Pod, map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram)
 	modelsFn     func(string, *corev1.Pod) ([]string, error)
-	metricsCalls int
-	modelsCalls  int
+	metricsCalls atomic.Int64
+	modelsCalls  atomic.Int64
 }
 
 func (f *fakePodRuntimeInspector) GetPodMetrics(engine string, pod *corev1.Pod, previousHistogram map[string]*dto.Histogram) (map[string]float64, map[string]*dto.Histogram) {
-	f.metricsCalls++
+	f.metricsCalls.Add(1)
 	if f.metricsFn == nil {
 		return nil, nil
 	}
@@ -1482,7 +1484,7 @@ func (f *fakePodRuntimeInspector) GetPodMetrics(engine string, pod *corev1.Pod, 
 }
 
 func (f *fakePodRuntimeInspector) GetPodModels(engine string, pod *corev1.Pod) ([]string, error) {
-	f.modelsCalls++
+	f.modelsCalls.Add(1)
 	if f.modelsFn == nil {
 		return nil, nil
 	}
@@ -1619,10 +1621,10 @@ func TestAddOrUpdatePod_MetricsPreservedOnUpdate(t *testing.T) {
 			pod := createTestPod("default", "pod1")
 			err := s.AddOrUpdatePod(pod, []*aiv1alpha1.ModelServer{ms})
 			assert.NoError(t, err)
-			assert.Equal(t, 1, inspector.metricsCalls, "backend metrics should be fetched on initial pod add")
-			assert.Equal(t, 1, inspector.modelsCalls, "backend models should be fetched on initial pod add")
-			inspector.metricsCalls = 0
-			inspector.modelsCalls = 0
+			assert.Equal(t, int64(1), inspector.metricsCalls.Load(), "backend metrics should be fetched on initial pod add")
+			assert.Equal(t, int64(1), inspector.modelsCalls.Load(), "backend models should be fetched on initial pod add")
+			inspector.metricsCalls.Store(0)
+			inspector.modelsCalls.Store(0)
 
 			// Simulate a pod update (e.g. label change)
 			updatedPod := pod.DeepCopy()
@@ -1632,8 +1634,8 @@ func TestAddOrUpdatePod_MetricsPreservedOnUpdate(t *testing.T) {
 
 			err = s.AddOrUpdatePod(updatedPod, []*aiv1alpha1.ModelServer{ms})
 			assert.NoError(t, err)
-			assert.Equal(t, 0, inspector.metricsCalls, "backend.GetPodMetrics must not be called on pod update")
-			assert.Equal(t, 0, inspector.modelsCalls, "backend.GetPodModels must not be called on pod update")
+			assert.Equal(t, int64(0), inspector.metricsCalls.Load(), "backend.GetPodMetrics must not be called on pod update")
+			assert.Equal(t, int64(0), inspector.modelsCalls.Load(), "backend.GetPodModels must not be called on pod update")
 
 			podInfo := s.GetPodInfo(utils.GetNamespaceName(updatedPod))
 			assert.NotNil(t, podInfo)
@@ -1687,8 +1689,8 @@ func TestAddOrUpdatePod_NewPodStillFetchesMetrics(t *testing.T) {
 	err := s.AddOrUpdatePod(pod, []*aiv1alpha1.ModelServer{ms})
 	assert.NoError(t, err)
 
-	assert.Equal(t, 1, inspector.metricsCalls, "backend.GetPodMetrics must be called for new pods")
-	assert.Equal(t, 1, inspector.modelsCalls, "backend.GetPodModels must be called for new pods")
+	assert.Equal(t, int64(1), inspector.metricsCalls.Load(), "backend.GetPodMetrics must be called for new pods")
+	assert.Equal(t, int64(1), inspector.modelsCalls.Load(), "backend.GetPodModels must be called for new pods")
 
 	podInfo := s.GetPodInfo(utils.GetNamespaceName(pod))
 	assert.InDelta(t, 0.3, podInfo.GetGPUCacheUsage(), 1e-9)
@@ -1720,16 +1722,16 @@ func TestAddOrUpdatePod_ModelServerChangePreservesMetrics(t *testing.T) {
 	pod := createTestPod("default", "pod1")
 	err := s.AddOrUpdatePod(pod, []*aiv1alpha1.ModelServer{ms1})
 	assert.NoError(t, err)
-	assert.Equal(t, 1, inspector.metricsCalls, "backend metrics should be fetched on initial pod add")
-	assert.Equal(t, 1, inspector.modelsCalls, "backend models should be fetched on initial pod add")
-	inspector.metricsCalls = 0
-	inspector.modelsCalls = 0
+	assert.Equal(t, int64(1), inspector.metricsCalls.Load(), "backend metrics should be fetched on initial pod add")
+	assert.Equal(t, int64(1), inspector.modelsCalls.Load(), "backend models should be fetched on initial pod add")
+	inspector.metricsCalls.Store(0)
+	inspector.modelsCalls.Store(0)
 
 	// Move pod from ms1 to ms2
 	err = s.AddOrUpdatePod(pod, []*aiv1alpha1.ModelServer{ms2})
 	assert.NoError(t, err)
-	assert.Equal(t, 0, inspector.metricsCalls, "backend.GetPodMetrics must not be called on pod update")
-	assert.Equal(t, 0, inspector.modelsCalls, "backend.GetPodModels must not be called on pod update")
+	assert.Equal(t, int64(0), inspector.metricsCalls.Load(), "backend.GetPodMetrics must not be called on pod update")
+	assert.Equal(t, int64(0), inspector.modelsCalls.Load(), "backend.GetPodModels must not be called on pod update")
 
 	podInfo := s.GetPodInfo(utils.GetNamespaceName(pod))
 	assert.InDelta(t, 0.6, podInfo.GetGPUCacheUsage(), 1e-9,

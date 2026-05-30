@@ -67,19 +67,23 @@ func (m *TokenizerManager) createTokenizerFromPods(model string, pods []*datasto
 	for i := 0; i < len(pods); i++ {
 		podIdx := (startIdx + i) % len(pods)
 		podInfo := pods[podIdx]
+		pod := podInfo.GetPod()
+		if pod == nil {
+			continue
+		}
 
 		engine, err := normalizeEngine(podInfo.GetEngine())
 		if err != nil {
-			klog.Warningf("TokenizerManager: invalid engine for pod %s: %v", podInfo.Pod.Name, err)
+			klog.Warningf("TokenizerManager: invalid engine for pod %s: %v", pod.Name, err)
 			unsupportedEngines[podInfo.GetEngine()] = struct{}{}
 			continue
 		}
 		template, ok := m.config.EndpointTemplates[engine]
 		if !ok || template == "" {
-			klog.Warningf("TokenizerManager: no endpoint template for engine %q, skipping pod %s", engine, podInfo.Pod.Name)
+			klog.Warningf("TokenizerManager: no endpoint template for engine %q, skipping pod %s", engine, pod.Name)
 			continue
 		}
-		endpoint := fmt.Sprintf(template, podInfo.Pod.Status.PodIP)
+		endpoint := fmt.Sprintf(template, pod.Status.PodIP)
 
 		config := RemoteTokenizerConfig{
 			Engine:             engine,
