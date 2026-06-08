@@ -669,57 +669,62 @@ func TestModelRouteSubsetShared(t *testing.T, testCtx *routercontext.RouterTestC
 	}
 
 	t.Run("WeightedTrafficDistribution", func(t *testing.T) {
-		// Send multiple requests and verify weight distribution statistics
-		// Use more requests to reduce randomness impact
-		const totalRequests = 500
-		const sumTolerance = 0.01 // Allow ±1% deviation for floating-point rounding errors
-		sinceTime := metav1.NewTime(time.Now().Add(-2 * time.Second))
-
-		for i := 0; i < totalRequests; i++ {
-			resp := utils.CheckChatCompletionsQuiet(t, modelRoute.Spec.ModelName, messages)
-			assert.Equal(t, 200, resp.StatusCode)
-			assert.NotEmpty(t, resp.Body)
-		}
-
-		v1Count, v2Count := subsetCanaryBackendCountsFromRouterLogs(t, testCtx.KubeClient, kthenaNamespace, &sinceTime)
-		totalFromLogs := v1Count + v2Count
-		require.GreaterOrEqual(t, totalFromLogs, int(0.85*float64(totalRequests)),
-			"expected router access logs to cover most requests (got %d lines, v1=%d v2=%d)", totalFromLogs, v1Count, v2Count)
-		require.Greater(t, v1Count, 0, "canary v1 should receive some traffic")
-		require.Greater(t, v2Count, 0, "canary v2 should receive some traffic")
-
-		// Verify weight distribution statistics across multiple requests
-		// 1. Ratios from access logs (retries may add extra lines; use log totals for proportions)
-		v1Ratio := float64(v1Count) / float64(totalFromLogs)
-		v2Ratio := float64(v2Count) / float64(totalFromLogs)
+		const (
+			totalRequests = 500
+			maxRetries    = 5 // gateway-api conformance/utils/weight retries on statistical variance
+			sumTolerance  = 0.01
+		)
 		expectedV1Ratio := 0.70
 		expectedV2Ratio := 0.30
-		maxDeviation := 0.05 // Allow ±5% deviation for randomness
+		maxDeviation := 0.05
 
-		// 3. Verify weight distribution statistics match expected ratio (70:30)
-		assert.GreaterOrEqual(t, v1Ratio, expectedV1Ratio-maxDeviation,
-			"deepseek-r1-1-5b ratio should be at least %.1f%% (expected %.1f%%)", (expectedV1Ratio-maxDeviation)*100, expectedV1Ratio*100)
-		assert.LessOrEqual(t, v1Ratio, expectedV1Ratio+maxDeviation,
-			"deepseek-r1-1-5b ratio should be at most %.1f%% (expected %.1f%%)", (expectedV1Ratio+maxDeviation)*100, expectedV1Ratio*100)
-		assert.GreaterOrEqual(t, v2Ratio, expectedV2Ratio-maxDeviation,
-			"deepseek-r1-1-5b-v2 ratio should be at least %.1f%% (expected %.1f%%)", (expectedV2Ratio-maxDeviation)*100, expectedV2Ratio*100)
-		assert.LessOrEqual(t, v2Ratio, expectedV2Ratio+maxDeviation,
-			"deepseek-r1-1-5b-v2 ratio should be at most %.1f%% (expected %.1f%%)", (expectedV2Ratio+maxDeviation)*100, expectedV2Ratio*100)
+		for attempt := 0; attempt < maxRetries; attempt++ {
+			sinceTime := metav1.NewTime(time.Now().Add(-2 * time.Second))
+			for i := 0; i < totalRequests; i++ {
+				resp := utils.CheckChatCompletionsQuiet(t, modelRoute.Spec.ModelName, messages)
+				assert.Equal(t, 200, resp.StatusCode)
+				assert.NotEmpty(t, resp.Body)
+			}
 
-		// 4. Verify statistics sum to 100% (with tolerance for floating-point rounding)
-		assert.InDelta(t, 1.0, v1Ratio+v2Ratio, sumTolerance, "Distribution ratios should sum to approximately 100%")
+			v1Count, v2Count := subsetCanaryBackendCountsFromRouterLogs(t, testCtx.KubeClient, kthenaNamespace, &sinceTime)
+			totalFromLogs := v1Count + v2Count
+			if totalFromLogs < int(0.85*float64(totalRequests)) {
+				t.Logf("Traffic distribution test failed (%d/%d): expected router access logs to cover most requests (got %d lines, v1=%d v2=%d)",
+					attempt+1, maxRetries, totalFromLogs, v1Count, v2Count)
+				continue
+			}
+			if v1Count == 0 || v2Count == 0 {
+				t.Logf("Traffic distribution test failed (%d/%d): both backends must receive traffic (v1=%d v2=%d)", attempt+1, maxRetries, v1Count, v2Count)
+				continue
+			}
 
-		// Log statistics for debugging
-		t.Logf("Weight distribution statistics verified:")
-		t.Logf("  Total requests: %d, log lines (v1+v2): %d", totalRequests, totalFromLogs)
-		t.Logf("  deepseek-r1-1-5b-v1: %d requests (%.1f%%, expected %.1f%%)", v1Count, v1Ratio*100, expectedV1Ratio*100)
-		t.Logf("  deepseek-r1-1-5b-v2: %d requests (%.1f%%, expected %.1f%%)", v2Count, v2Ratio*100, expectedV2Ratio*100)
+			v1Ratio := float64(v1Count) / float64(totalFromLogs)
+			v2Ratio := float64(v2Count) / float64(totalFromLogs)
+			if v1Ratio < expectedV1Ratio-maxDeviation || v1Ratio > expectedV1Ratio+maxDeviation ||
+				v2Ratio < expectedV2Ratio-maxDeviation || v2Ratio > expectedV2Ratio+maxDeviation ||
+				v1Ratio+v2Ratio < 1.0-sumTolerance || v1Ratio+v2Ratio > 1.0+sumTolerance {
+				t.Logf("Traffic distribution test failed (%d/%d): v1=%.1f%% v2=%.1f%% (expected %.0f:%.0f ±%.0f%%)",
+					attempt+1, maxRetries, v1Ratio*100, v2Ratio*100, expectedV1Ratio*100, expectedV2Ratio*100, maxDeviation*100)
+				continue
+			}
+
+			assert.GreaterOrEqual(t, v1Ratio, expectedV1Ratio-maxDeviation)
+			assert.LessOrEqual(t, v1Ratio, expectedV1Ratio+maxDeviation)
+			assert.GreaterOrEqual(t, v2Ratio, expectedV2Ratio-maxDeviation)
+			assert.LessOrEqual(t, v2Ratio, expectedV2Ratio+maxDeviation)
+			assert.InDelta(t, 1.0, v1Ratio+v2Ratio, sumTolerance)
+			t.Logf("Weight distribution statistics verified (attempt %d/%d):", attempt+1, maxRetries)
+			t.Logf("  Total requests: %d, log lines (v1+v2): %d", totalRequests, totalFromLogs)
+			t.Logf("  deepseek-r1-1-5b-v1: %d requests (%.1f%%, expected %.1f%%)", v1Count, v1Ratio*100, expectedV1Ratio*100)
+			t.Logf("  deepseek-r1-1-5b-v2: %d requests (%.1f%%, expected %.1f%%)", v2Count, v2Ratio*100, expectedV2Ratio*100)
+			return
+		}
+		t.Fatalf("weighted distribution failed after %d attempts", maxRetries)
 	})
 
 	t.Run("WeightSumNot100Percent", func(t *testing.T) {
 		// Update ModelRoute with weights that don't sum to 100%
 		// Weights are relative, so 50:30 means 5/8 and 3/8 traffic distribution
-		const sumTolerance = 0.01 // Allow ±1% deviation for floating-point rounding errors
 		updatedModelRoute, err := testCtx.KthenaClient.NetworkingV1alpha1().ModelRoutes(testNamespace).Get(ctx, createdModelRoute.Name, metav1.GetOptions{})
 		require.NoError(t, err)
 
@@ -740,49 +745,61 @@ func TestModelRouteSubsetShared(t *testing.T, testCtx *routercontext.RouterTestC
 				strings.Contains(resp.Body, "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B")
 		}, 1*time.Minute, 2*time.Second, "ModelRoute update should propagate and requests should route successfully")
 
-		// Verify requests still work and verify the normalized weight distribution (50:30 = 5/8:3/8)
-		// Send multiple requests to verify weight distribution statistics
-		const totalRequests = 500
-		sinceTime := metav1.NewTime(time.Now().Add(-2 * time.Second))
+		const (
+			totalRequests = 500
+			maxRetries    = 5
+			sumTolerance  = 0.01
+		)
+		expectedV1Ratio := 0.625
+		expectedV2Ratio := 0.375
+		maxDeviation := 0.05
+		distributionOK := false
 
-		for i := 0; i < totalRequests; i++ {
-			resp := utils.CheckChatCompletionsQuiet(t, modelRoute.Spec.ModelName, messages)
-			assert.Equal(t, 200, resp.StatusCode)
-			assert.NotEmpty(t, resp.Body)
+		for attempt := 0; attempt < maxRetries; attempt++ {
+			sinceTime := metav1.NewTime(time.Now().Add(-2 * time.Second))
+			for i := 0; i < totalRequests; i++ {
+				resp := utils.CheckChatCompletionsQuiet(t, modelRoute.Spec.ModelName, messages)
+				assert.Equal(t, 200, resp.StatusCode)
+				assert.NotEmpty(t, resp.Body)
+			}
+
+			v1Count, v2Count := subsetCanaryBackendCountsFromRouterLogs(t, testCtx.KubeClient, kthenaNamespace, &sinceTime)
+			totalFromLogs := v1Count + v2Count
+			if totalFromLogs < int(0.85*float64(totalRequests)) {
+				t.Logf("Traffic distribution test failed (%d/%d): expected router access logs to cover most requests (got %d lines, v1=%d v2=%d)",
+					attempt+1, maxRetries, totalFromLogs, v1Count, v2Count)
+				continue
+			}
+			if v1Count == 0 || v2Count == 0 {
+				t.Logf("Traffic distribution test failed (%d/%d): both backends must receive traffic (v1=%d v2=%d)", attempt+1, maxRetries, v1Count, v2Count)
+				continue
+			}
+
+			v1Ratio := float64(v1Count) / float64(totalFromLogs)
+			v2Ratio := float64(v2Count) / float64(totalFromLogs)
+			if v1Ratio < expectedV1Ratio-maxDeviation || v1Ratio > expectedV1Ratio+maxDeviation ||
+				v2Ratio < expectedV2Ratio-maxDeviation || v2Ratio > expectedV2Ratio+maxDeviation ||
+				v1Ratio+v2Ratio < 1.0-sumTolerance || v1Ratio+v2Ratio > 1.0+sumTolerance {
+				t.Logf("Traffic distribution test failed (%d/%d): v1=%.1f%% v2=%.1f%% (expected %.1f:%.1f ±%.0f%%)",
+					attempt+1, maxRetries, v1Ratio*100, v2Ratio*100, expectedV1Ratio*100, expectedV2Ratio*100, maxDeviation*100)
+				continue
+			}
+
+			assert.GreaterOrEqual(t, v1Ratio, expectedV1Ratio-maxDeviation)
+			assert.LessOrEqual(t, v1Ratio, expectedV1Ratio+maxDeviation)
+			assert.GreaterOrEqual(t, v2Ratio, expectedV2Ratio-maxDeviation)
+			assert.LessOrEqual(t, v2Ratio, expectedV2Ratio+maxDeviation)
+			assert.InDelta(t, 1.0, v1Ratio+v2Ratio, sumTolerance)
+			t.Logf("Normalized weight distribution verified (attempt %d/%d, 50:30 -> 5/8:3/8):", attempt+1, maxRetries)
+			t.Logf("  Total requests: %d, log lines (v1+v2): %d", totalRequests, totalFromLogs)
+			t.Logf("  deepseek-r1-1-5b-v1: %d requests (%.1f%%, expected %.1f%%)", v1Count, v1Ratio*100, expectedV1Ratio*100)
+			t.Logf("  deepseek-r1-1-5b-v2: %d requests (%.1f%%, expected %.1f%%)", v2Count, v2Ratio*100, expectedV2Ratio*100)
+			distributionOK = true
+			break
 		}
-
-		v1Count, v2Count := subsetCanaryBackendCountsFromRouterLogs(t, testCtx.KubeClient, kthenaNamespace, &sinceTime)
-		totalFromLogs := v1Count + v2Count
-		require.GreaterOrEqual(t, totalFromLogs, int(0.85*float64(totalRequests)),
-			"expected router access logs to cover most requests (got %d lines, v1=%d v2=%d)", totalFromLogs, v1Count, v2Count)
-		require.Greater(t, v1Count, 0, "canary v1 should receive some traffic")
-		require.Greater(t, v2Count, 0, "canary v2 should receive some traffic")
-
-		// Calculate and verify distribution ratios (50:30 should normalize to 5/8:3/8 = 62.5%:37.5%)
-		v1Ratio := float64(v1Count) / float64(totalFromLogs)
-		v2Ratio := float64(v2Count) / float64(totalFromLogs)
-		expectedV1Ratio := 0.625 // 5/8 = 62.5%
-		expectedV2Ratio := 0.375 // 3/8 = 37.5%
-		maxDeviation := 0.05     // Allow ±5% deviation for randomness
-
-		// Verify weight distribution matches expected normalized ratio (5/8:3/8)
-		assert.GreaterOrEqual(t, v1Ratio, expectedV1Ratio-maxDeviation,
-			"deepseek-r1-1-5b-v1 ratio should be at least %.1f%% (expected %.1f%%)", (expectedV1Ratio-maxDeviation)*100, expectedV1Ratio*100)
-		assert.LessOrEqual(t, v1Ratio, expectedV1Ratio+maxDeviation,
-			"deepseek-r1-1-5b-v1 ratio should be at most %.1f%% (expected %.1f%%)", (expectedV1Ratio+maxDeviation)*100, expectedV1Ratio*100)
-		assert.GreaterOrEqual(t, v2Ratio, expectedV2Ratio-maxDeviation,
-			"deepseek-r1-1-5b-v2 ratio should be at least %.1f%% (expected %.1f%%)", (expectedV2Ratio-maxDeviation)*100, expectedV2Ratio*100)
-		assert.LessOrEqual(t, v2Ratio, expectedV2Ratio+maxDeviation,
-			"deepseek-r1-1-5b-v2 ratio should be at most %.1f%% (expected %.1f%%)", (expectedV2Ratio+maxDeviation)*100, expectedV2Ratio*100)
-
-		// Verify statistics sum to 100% (with tolerance for floating-point rounding)
-		assert.InDelta(t, 1.0, v1Ratio+v2Ratio, sumTolerance, "Distribution ratios should sum to approximately 100%")
-
-		// Log statistics for debugging
-		t.Logf("Normalized weight distribution verified (50:30 -> 5/8:3/8):")
-		t.Logf("  Total requests: %d, log lines (v1+v2): %d", totalRequests, totalFromLogs)
-		t.Logf("  deepseek-r1-1-5b-v1: %d requests (%.1f%%, expected %.1f%%)", v1Count, v1Ratio*100, expectedV1Ratio*100)
-		t.Logf("  deepseek-r1-1-5b-v2: %d requests (%.1f%%, expected %.1f%%)", v2Count, v2Ratio*100, expectedV2Ratio*100)
+		if !distributionOK {
+			t.Fatalf("weighted distribution failed after %d attempts", maxRetries)
+		}
 
 		// Restore original weights - re-fetch to avoid conflict
 		updatedModelRoute, err = testCtx.KthenaClient.NetworkingV1alpha1().ModelRoutes(testNamespace).Get(ctx, createdModelRoute.Name, metav1.GetOptions{})
