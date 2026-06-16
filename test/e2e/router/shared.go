@@ -434,6 +434,11 @@ func testModelRoutePrefillDecodeDisaggregationSharedWithFixtures(
 	messages := []utils.ChatMessage{
 		utils.NewChatMessage("user", "Hello"),
 	}
+
+	// Wait for the python mocker server in the pod to fully start up and bind to its port.
+	// Without this, CheckChatCompletions' 65s limit might be exceeded if image pull + startup is slow.
+	utils.WaitForChatModelReady(t, utils.DefaultRouterURL, modelRoute.Spec.ModelName, messages, 3*time.Minute)
+
 	utils.CheckChatCompletions(t, modelRoute.Spec.ModelName, messages)
 }
 
@@ -764,6 +769,8 @@ func TestModelRouteWithRateLimitShared(t *testing.T, testCtx *routercontext.Rout
 
 		modelRoute := utils.LoadYAMLFromFile[networkingv1alpha1.ModelRoute](filepath.Join(routercontext.TestDataDir, "ModelRouteWithRateLimit.yaml"))
 		modelRoute.Namespace = testNamespace
+		modelRoute.Name = modelRoute.Name + "-test2"
+		modelRoute.Spec.ModelName = modelRoute.Spec.ModelName + "-test2"
 		// Only test input rate limit; remove output limit to avoid 429 "output token rate limit exceeded"
 		if modelRoute.Spec.RateLimit != nil {
 			modelRoute.Spec.RateLimit.OutputTokensPerUnit = nil
@@ -841,6 +848,8 @@ func TestModelRouteWithRateLimitShared(t *testing.T, testCtx *routercontext.Rout
 
 		modelRoute := utils.LoadYAMLFromFile[networkingv1alpha1.ModelRoute](filepath.Join(routercontext.TestDataDir, "ModelRouteWithRateLimit.yaml"))
 		modelRoute.Namespace = testNamespace
+		modelRoute.Name = modelRoute.Name + "-test3"
+		modelRoute.Spec.ModelName = modelRoute.Spec.ModelName + "-test3"
 		// Only test input rate limit; remove output limit to avoid 429 "output token rate limit exceeded"
 		if modelRoute.Spec.RateLimit != nil {
 			modelRoute.Spec.RateLimit.OutputTokensPerUnit = nil
@@ -917,6 +926,8 @@ func TestModelRouteWithRateLimitShared(t *testing.T, testCtx *routercontext.Rout
 
 		modelRoute := utils.LoadYAMLFromFile[networkingv1alpha1.ModelRoute](filepath.Join(routercontext.TestDataDir, "ModelRouteWithRateLimit.yaml"))
 		modelRoute.Namespace = testNamespace
+		modelRoute.Name = modelRoute.Name + "-test4"
+		modelRoute.Spec.ModelName = modelRoute.Spec.ModelName + "-test4"
 		setupModelRouteWithGatewayAPI(modelRoute, useGatewayApi, kthenaNamespace)
 
 		createdModelRoute, err := testCtx.KthenaClient.NetworkingV1alpha1().ModelRoutes(testNamespace).Create(ctx, modelRoute, metav1.CreateOptions{})
