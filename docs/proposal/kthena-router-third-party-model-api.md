@@ -36,13 +36,13 @@ graph LR
 
 This proposal evaluates two API shapes. **Option A** extends `ModelServer` with external provider fields. **Option B** adds a dedicated `ExternalModelProvider` CRD. The proposal recommends Option B, while keeping Option A as a valid lower-churn fallback. The final API shape should be confirmed with the mentor/maintainers.
 
-Day-one endpoint scope is intentionally small:
+The MVP endpoint scope is intentionally small:
 
-| Endpoint | Day-one? | Reason |
+| Endpoint | MVP | Notes |
 |---|---|---|
-| `/v1/chat/completions` | ✅Supported | Already parsed by the Router pre-routing path (`messages`) |
-| `/v1/completions` | ✅Supported | Already parsed by the Router pre-routing path (`prompt`) |
-| `/v1/embeddings` | ❌ Fast-follow | Uses `input`, not `messages`/`prompt`; needs a small parser change first |
+| `/v1/chat/completions` | Supported | Text-only requests where `messages[].content` is a string |
+| `/v1/completions` | Supported | Text-only requests where `prompt` is a string |
+| `/v1/embeddings` | Not supported | Uses `input`, while the current router requires a text `ChatMessage` before target selection; support needs a separate request-processing design |
 
 ### Motivation
 
@@ -71,7 +71,7 @@ External providers should therefore **skip Pod scheduling** and go directly thro
 
 ### Goals
 
-- Route matched requests to an external OpenAI-compatible API.
+- Route text-only `/v1/chat/completions` and `/v1/completions` requests to an external OpenAI-compatible API.
 - Reference credentials through Kubernetes `Secret`s, never inline plaintext.
 - Reuse Router auth, rate limiting, access logging, metrics, model rewrite, and weighted traffic splitting.
 - Support streaming SSE passthrough for chat/completion requests.
@@ -81,11 +81,13 @@ External providers should therefore **skip Pod scheduling** and go directly thro
 ### Non-Goals
 
 - Native Gemini, Anthropic, Bedrock, or Vertex request/response translation. (Note: Gemini and Cohere expose OpenAI-compatible endpoints — e.g. Gemini's `/v1beta/openai` prefix — so they work day-one via `baseURL` without a new adapter. Only their *native* formats are out of scope.)
-- `/v1/embeddings` support in the first implementation.
+- `/v1/embeddings` support. The current router requires a text `ChatMessage` before target selection, so supporting `input` needs wider changes to request parsing, token counting, rate limiting, and scheduling.
+- Multimodal chat content such as `messages[].content` arrays.
 - Pod scheduling, KV-cache-aware routing, prefix-aware routing, LoRA affinity, or PD disaggregation for external providers.
 - Managing the external service lifecycle.
 - Provider-side multi-endpoint load balancing beyond what weighted `targetModels[]` can already express.
 - Automatic failure fallback from one selected target to another.
+- Automatic retry of external-provider requests and configurable timeout/retry policies.
 
 ### API Options
 
@@ -97,7 +99,7 @@ This is the lower-churn shape because it preserves the existing `ModelRoute -> M
 
 #### Option B: Add ExternalModelProvider
 
-Option B adds a namespaced `ExternalModelProvider` CRD and extends `ModelRoute.targetModels[]` with an `externalProviderRef`. `ModelServer` remains the resource for Pod-backed serving, while external providers get their own fields for endpoint, credentials, protocol, and transport policy.
+Option B adds a namespaced `ExternalModelProvider` CRD and extends `ModelRoute.targetModels[]` with an `externalProviderRef`. `ModelServer` remains the resource for Pod-backed serving, while external providers get their own fields for endpoint, credentials, and protocol.
 
 This proposal recommends Option B because Kthena is CRD-native and `ModelServer` is already documented and implemented around Pods. Separating the resources keeps lifecycle, validation, status, and future provider-specific fields cleaner.
 
@@ -134,14 +136,13 @@ graph TD
 | `baseURL` | string | yes | — | `^https?://.+`; HTTPS unless `allowInsecure` |
 | `allowInsecure` | bool | no | `false` | Permits `http://` for local/mock providers |
 | `auth` | `ProviderAuth` | no | — | Credential Secret reference; if unset, no auth header is injected |
-| `headers` | map | no | — | Static upstream headers; cannot override auth, `Host`, `Content-Length`, or hop-by-hop headers |
-| `trafficPolicy` | `TrafficPolicy` | no | — | Reuses existing timeout/retry behavior |
+| `headers` | map | no | — | Non-sensitive static upstream headers; credentials must use `auth.secretRef` |
 
 `ProviderAuth` fields:
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `secretRef` | `corev1.SecretKeySelector` | — | `{name, key}`, same namespace (required) |
+| `secretRef` | `corev1.SecretKeySelector` | — | `{name, key}`, same namespace; `optional` must be unset or `false` |
 | `header` | string | `Authorization` | Header carrying the credential |
 | `scheme` | enum | `Bearer` | `Bearer` → `Authorization: Bearer <key>`; `Raw` → `<key>` |
 
@@ -182,16 +183,15 @@ type ExternalModelProviderSpec struct {
     // +optional
     Auth *ProviderAuth `json:"auth,omitempty"`
 
-    // Static headers added to upstream requests. Must not override the configured
-    // auth header or hop-by-hop/request-routing headers such as Host and Content-Length.
+    // Non-sensitive static headers added to upstream requests. Credentials must use
+    // Auth.SecretRef. Reserved credential, hop-by-hop, and request-routing headers
+    // such as Authorization, Host, and Content-Length are forbidden.
     // +optional
     Headers map[string]string `json:"headers,omitempty"`
 
-    // Reuses existing timeout/retry behavior.
-    // +optional
-    TrafficPolicy *TrafficPolicy `json:"trafficPolicy,omitempty"`
 }
 
+// +kubebuilder:validation:XValidation:rule="!has(self.secretRef.optional) || !self.secretRef.optional",message="secretRef.optional must be false or unset"
 type ProviderAuth struct {
     // +kubebuilder:validation:Required
     SecretRef corev1.SecretKeySelector `json:"secretRef"`
@@ -217,7 +217,7 @@ type ExternalModelProviderStatus struct {
 
 `corev1.SecretKeySelector` is used intentionally instead of a custom selector. It keeps the API aligned with Kubernetes conventions while still allowing users to customize both the Secret name and the Secret key.
 
-Status should only report whether the provider config can be used in the MVP. The controller can report conditions such as `Ready` and `CredentialsResolved`, but it should not actively call third-party APIs to check health in the first implementation.
+Status should only report whether the provider config and referenced credentials can be used in the MVP. The controller can report conditions such as `Ready` and `CredentialsResolved`, but it should not actively call third-party APIs to check health in the first implementation. Secret add, update, and delete events must reconcile affected providers so these conditions do not become stale.
 
 Extend `TargetModel` with an external destination:
 
@@ -253,7 +253,9 @@ Validation:
 - `baseURL` must be parsed and must not contain URL userinfo, query, or
   fragment. This should be enforced by webhook validation because CEL is not a
   good fit for full URL parsing.
-- Static `headers` must not overwrite the configured auth header, `Host`, `Content-Length`, or hop-by-hop headers. Header names must be validated case-insensitively, for example by canonicalizing with `http.CanonicalHeaderKey` or comparing with `strings.EqualFold` in webhook validation.
+- Static `headers` are for non-sensitive values only. Always reject standard credential headers such as `Authorization`, `Proxy-Authorization`, and `Cookie`, plus the configured auth header, `Host`, `Content-Length`, and hop-by-hop headers. Custom credential headers must use `auth.header` with `auth.secretRef`. Header names must be validated case-insensitively, for example by canonicalizing with `http.CanonicalHeaderKey` or comparing with `strings.EqualFold` in webhook validation.
+- `auth.header` must be a valid HTTP header name and must not be `Host`, `Content-Length`, a hop-by-hop header, or another request-routing header.
+- `auth` may be omitted for providers that require no credential. When `auth` is present, its Secret and key are mandatory; reject `secretRef.optional=true` rather than silently sending an unauthenticated request.
 - `secretRef.name` and `secretRef.key` are structurally validated at admission time. Secret existence and key availability are resolved asynchronously by the controller/router lister and reported through provider status.
 
 Example:
@@ -282,8 +284,6 @@ spec:
       key: apiKey
     header: Authorization
     scheme: Bearer
-  trafficPolicy:
-    timeout: 60s
 ---
 apiVersion: networking.serving.volcano.sh/v1alpha1
 kind: ModelRoute
@@ -366,9 +366,9 @@ Mapped onto the documented Router pipeline stages, the external path is **additi
 | Scheduling | Pod filter/score | ⏭️ **skipped** (no Pods) |
 | LoadBalancing | weighted Pod pick | 🔁 **replaced** by provider client |
 | Proxy | `doRequest(podIP)` | 🔁 **replaced** by provider call |
-| Response forwarding | `forwardResponse` | ✅ **same** `forwardResponse` |
+| Response forwarding | Shared body/SSE mechanics after Pod-specific status handling | Shared body/SSE mechanics; provider HTTP errors pass through |
 
-The external path skips Pod scheduling, reuses the front half of the pipeline, and shares the same response-forwarding behavior.
+The external path skips Pod scheduling, reuses the front half of the pipeline, and shares response-copying, SSE, and usage-parsing mechanics. Status acceptance, retry, and fallback behavior remain path-specific.
 
 ### Implementation Details
 
@@ -440,13 +440,13 @@ type Input struct {
 }
 ```
 
-The adapter decides what the upstream request should look like: URL, model rewrite, headers, and future provider-specific conversion. The shared transport sends the HTTP request and handles connection pooling, TLS, redirects, timeouts, and retry policy. If an implementation keeps a provider-level `Do()` helper, it should only call the shared transport instead of adding separate network rules inside each provider.
+The adapter decides what the upstream request should look like: URL, model rewrite, headers, and future provider-specific conversion. The shared transport sends the HTTP request and handles connection pooling, TLS, redirects, and connection-level timeouts. The MVP does not automatically retry external-provider requests. If an implementation keeps a provider-level `Do()` helper, it should only call the shared transport instead of adding separate network rules inside each provider.
 
 The MVP provider only needs OpenAI-compatible passthrough:
 
 - Treat `baseURL` as the provider's OpenAI-compatible API root. Strip the public Router `/v1` prefix from the original path before joining. For example, `/v1/chat/completions` joined with `https://api.example.com/v1` becomes `https://api.example.com/v1/chat/completions`, and the same request joined with `https://generativelanguage.googleapis.com/v1beta/openai` becomes `https://generativelanguage.googleapis.com/v1beta/openai/chat/completions`.
 - Inject auth from Secret.
-- Copy allowed downstream headers.
+- Do not copy downstream headers wholesale. Forward only `Content-Type`, `Accept`, and explicitly allowed tracing/request-correlation headers. Strip `Authorization`, `Proxy-Authorization`, `Cookie`, `Host`, `Content-Length`, hop-by-hop headers, and the configured provider auth header; apply static headers and then inject the provider credential last so client input cannot override it.
 - Rewrite `model` to the upstream model name.
 - Use request context for cancellation.
 - Execute the request through the shared transport.
@@ -500,11 +500,11 @@ The external path should:
 - Record output tokens for rate limiting, access logs, and metrics when usage is available.
 - Continue forwarding the stream even if usage is absent.
 - Cancel the upstream request and exit the forwarding loop when the downstream client disconnects.
-- Never retry after the stream has started.
+- Never automatically retry the provider request, including after a stream has started.
 
 Streaming requests should not use `http.Client.Timeout` as a total request timeout, because a valid model stream can last longer than a normal non-streaming request. The MVP should use request context plus HTTP connection timeouts such as connect, TLS handshake, response-header, and idle connection timeouts. More specific first-token or stream-idle timeout fields can be added later.
 
-This is why response forwarding should be shared instead of implemented separately for providers.
+The streaming copy and usage-parsing mechanics should be shared instead of implemented separately for providers. Status acceptance, retry, and fallback decisions remain path-specific and happen before response forwarding starts.
 
 #### Response Forwarding
 
@@ -527,49 +527,86 @@ type TokenUsage struct {
 
 `TokenUsage` should live in a small shared router package rather than exposing a handler-specific response type through the forwarding API.
 
-The code that receives `resp` from the transport should close `resp.Body`. `forwardResponse()` should only copy headers/status/body, stream data, and parse usage. The Pod path and external path should follow the same rule for who closes the response body.
+The code that receives `resp` from the transport should close `resp.Body`. `forwardResponse()` should only copy headers/status/body, stream data, and parse usage. It must not decide whether a status is acceptable or whether another upstream should be attempted. The Pod path and external path should follow the same rule for who closes the response body.
 
-Both Pod and external paths should use the same forwarding behavior:
+After path-specific status handling accepts a response, both Pod and external paths should reuse the same forwarding mechanics:
 
-- Copy upstream headers.
-- Preserve upstream status and body.
+- Copy end-to-end upstream headers. Strip hop-by-hop headers, and omit the upstream `Content-Length` when streaming or when the forwarded body is modified.
+- Copy the accepted upstream status and body.
 - Stream SSE line by line.
 - Parse usage chunks when available.
 - Record output tokens for rate limit and metrics.
 
-Provider HTTP errors with a response are passed through unchanged; only transport failures without an upstream response are created by the Router:
+This does not make the two paths' error semantics identical. The existing Pod path remains unchanged: it treats a non-2xx response as a failed Pod attempt, tries another candidate Pod when available, and returns a Router-generated error after all candidates fail.
+The external provider path has no implicit fallback to another weighted target after target selection, so an upstream HTTP error response is passed through to the client.
 
-| Upstream outcome | What the client receives |
-|---|---|
-| `4xx` with body (e.g. `401`, or `429` after retry budget is exhausted) | Pass through status + body unchanged |
-| `5xx` with body (e.g. `500`, or `502`/`503` after retry budget is exhausted) | Pass through status + body unchanged |
-| Connection refused / TLS failure | Router-created `502 Bad Gateway` |
-| Timeout, no response bytes | Router-created `504 Gateway Timeout` |
-| Retry | Only for clearly retryable connection/setup failures before request submission is known, or explicitly retryable upstream responses such as `429`, `502`, or `503`; never after a stream starts |
+For external providers, every non-2xx response is passed through unchanged; only transport failures without an upstream response are created by the Router. The handler must set the fixed completion category before `RequestMetricsRecorder.Finish()` runs so a forwarded provider response is never incorrectly recorded as `successful_request`:
+
+| Upstream outcome | What the client receives | `error_type` | `error_origin` |
+|---|---|---|---|
+| `3xx` (automatic redirects are disabled) | Pass through status, headers, and body unchanged | `upstream_response` | `upstream` |
+| `4xx` with body (including `401` and `429`) | Pass through status + body unchanged | `upstream_response` | `upstream` |
+| `5xx` with body (including `500`, `502`, and `503`) | Pass through status + body unchanged | `upstream_response` | `upstream` |
+| Connection refused / TLS failure | Router-created `502 Bad Gateway` | `upstream_transport` | `router` |
+| Timeout, no response bytes | Router-created `504 Gateway Timeout` | `upstream_transport` | `router` |
+
+Access logs should record the provider status code and a bounded message such as `provider returned HTTP 429`; they must not copy an arbitrary provider error body into logs. Successful provider responses keep `error_type="successful_request"` and omit `error_origin`.
 
 #### Secret Resolution
 
 Add a Kubernetes Secret informer/lister to the router process. Secret rotation takes effect on the next request because credentials are resolved from the lister cache at request time.
 
+The provider controller should maintain an index from `<namespace>/<secret-name>` to the ExternalModelProviders that reference that Secret. ExternalModelProvider events reconcile the provider itself; Secret add, update, and delete events use the index to enqueue every affected provider. Reconciliation reads the Secret from the lister, checks the selected key, and updates `ObservedGeneration`, `CredentialsResolved`, and `Ready`. Status updates need RBAC for the `externalmodelproviders/status` subresource.
+
 Missing Secret or missing key should set provider status to `Ready=False` with a configuration reason such as `CredentialNotFound`. Requests targeting an unresolved provider should return `503 Service Unavailable`. Error messages must name the provider but never print the key value.
 
 #### Observability
 
-Do not create external-only metrics. Instead, add a few labels with limited values to the existing router metrics so dashboards can compare in-cluster and external traffic with the same metric names.
+`InferencePool` is an existing Gateway API Inference Extension destination reached through `HTTPRoute`; this proposal does not introduce or change that routing path. It is included below only because changing the shared Router metric schemas must keep every existing destination observable.
 
-Recommended labels to add where relevant:
+Do not create external-only metric names. Extend the existing request and upstream metrics with one shared set of bounded destination labels so the same PromQL can compare ModelServer, ExternalModelProvider, and existing InferencePool traffic.
 
-| Label | Values | Notes |
+Destination labels:
+
+| Label | Values | Source |
 |---|---|---|
-| `backend_type` | `model_server`, `external_provider` | Identifies whether the selected target is in-cluster or external |
-| `provider` | provider resource name, or empty/`none` for in-cluster traffic | Identifies the `ExternalModelProvider` without overloading `model_server` |
-| `upstream_model` | configured upstream model, or empty/`none` for in-cluster traffic | Comes from `ExternalProviderRef.Model`, not from the client request body |
+| `model_route` | namespaced ModelRoute name, or `none` | The matched ModelRoute; `none` when no ModelRoute was selected |
+| `backend_type` | `model_server`, `external_provider`, `inference_pool`, or `unresolved` | The selected destination kind; `unresolved` when the request ends before destination selection |
+| `backend_name` | namespaced backend resource name, or `none` | The selected ModelServer, ExternalModelProvider, or InferencePool |
+| `upstream_model` | configured upstream model, or `none` | `ExternalProviderRef.Model`; for a LoRA ModelServer request, the matched `ModelRoute.spec.loraAdapters[]` name; otherwise `ModelServer.spec.model` or the matched `ModelRoute.spec.modelName` when `spec.model` is unset |
 
-For example, add these labels to existing metrics such as `kthena_router_requests_total`, `kthena_router_request_duration_seconds`, `kthena_router_tokens_total`, and `kthena_router_active_upstream_requests` instead of adding `kthena_router_external_*` metric names. Existing in-cluster traffic should fill the new labels with default values so each metric always has the same label set.
+These labels are added only to metrics that describe a completed routed request or a real upstream attempt:
 
-Metric label values must stay controlled. `upstream_model` should come from the route config, not from the client request body, and status/error labels should use HTTP codes or fixed strings instead of raw error messages. A dedicated time-to-first-token metric would require adding a new metric, so it is left out of the MVP because maintainers prefer reusing existing metrics.
+| Metric | Existing labels | Labels to add |
+|---|---|---|
+| `kthena_router_requests_total` | `model`, `path`, `status_code`, `error_type` | `model_route`, `backend_type`, `backend_name`, `upstream_model` |
+| `kthena_router_request_duration_seconds` | `model`, `path`, `status_code` | `model_route`, `backend_type`, `backend_name`, `upstream_model` |
+| `kthena_router_tokens_total` | `model`, `path`, `token_type` | `model_route`, `backend_type`, `backend_name`, `upstream_model` |
+| `kthena_router_active_upstream_requests` | `model_server`, `model_route` | `backend_type`, `backend_name`, `upstream_model` |
 
-Access logs can add external fields because they are structured records, but existing fields should remain.
+Keep the existing `model_server` label on `kthena_router_active_upstream_requests` for query compatibility. Set it to `none` for ExternalModelProvider and InferencePool attempts; `backend_name` is the destination-neutral replacement for new queries.
+
+The following metrics keep their current label sets because they observe work before destination selection or a ModelServer-only internal phase: `kthena_router_active_requests`, `kthena_router_active_downstream_requests`, `kthena_router_rate_limit_exceeded_total`, the prefill/decode duration metrics, scheduler plugin metrics, fairness queue metrics, and tokenizer metrics.
+
+The router should use one request-scoped observation recorder rather than passing independent label strings to each metric call. The recorder starts with the client model and path, buffers input-token observations, and exposes a one-time `BindDestination()` operation after route target selection. Binding stores all four destination labels from the resolved Kubernetes configuration. Input tokens are emitted when the destination is bound; if the request ends before binding, `Finish()` emits them with the unresolved values. Output tokens, the final request counter, and request duration use the same bound label set. This avoids recording input and output tokens for the same request under different destinations.
+
+`BindDestination()` only records metric dimensions; it does not affect routing. The ModelRoute path calls it after selecting a ModelServer or ExternalModelProvider target. The existing HTTPRoute path must also call it after resolving an InferencePool, using `model_route="none"`, `backend_type="inference_pool"`, the namespaced InferencePool name as `backend_name`, and `upstream_model="none"`.
+
+For a LoRA request, binding uses the adapter name that was successfully matched from `ModelRoute.spec.loraAdapters[]` as `upstream_model`. This is metric attribution only; it does not change existing LoRA matching, scheduling, or model rewrite behavior.
+
+`kthena_router_active_upstream_requests` remains attempt-scoped rather than request-scoped. Increment it immediately before each actual Pod or provider call and decrement it on every completion path. A request that tries three Pods contributes three sequential upstream attempts but only one completed request to `kthena_router_requests_total`.
+
+All label values must be controlled:
+
+- Use `none`, never an absent or empty label value, when a dimension does not apply.
+- Use `unresolved` only for `backend_type` when routing never selected a destination.
+- Read `model_route`, `backend_name`, and `upstream_model` from resolved Kubernetes objects, not arbitrary request headers or error messages.
+- Never use Pod IPs, request IDs, Secret names or values, raw URLs, or raw errors as metric labels.
+- Continue using HTTP codes and fixed error categories for `status_code` and `error_type`: `successful_request` for provider 2xx responses, `upstream_response` for provider 3xx/4xx/5xx responses, and `upstream_transport` for connection, TLS, and timeout failures.
+
+Changing a Prometheus label set is a schema migration even when metric names remain unchanged. Update every metric call, dashboard, alert, recording rule, observability document, and e2e assertion in the same change. E2E helpers must aggregate every matching series instead of returning the first partial-label match, because one client model can now produce separate ModelServer and ExternalModelProvider series. A dedicated time-to-first-token metric would require a new metric name, so it remains outside the MVP.
+
+Access logs carry per-request diagnostic detail that is unsuitable for Prometheus labels. Add `backend_type`, `backend_name`, `upstream_model`, `upstream_status_code`, `upstream_attempts`, and a bounded `error_origin` (`router` or `upstream`) while retaining the existing `model_server`, `selected_pod`, and gateway fields.
 
 #### Future Work: Cost-Aware Routing
 
@@ -591,17 +628,19 @@ This proposal intentionally does not implement cost-aware routing in the first v
 
 ### Security and Validation
 
+- Treat ExternalModelProvider as trusted network configuration. Users allowed to create or update it can make the Router connect to arbitrary destinations reachable from the Router Pod, including cluster-internal addresses; same-namespace references and URL syntax validation do not prevent this SSRF capability.
+- Restrict ExternalModelProvider create/update permissions to trusted administrators or tenants that are explicitly allowed to select Router egress destinations. In multi-tenant installations, enforce the allowed destinations with Router egress NetworkPolicy, a proxy, or an environment-specific admission policy.
 - Never log Secret contents or upstream auth headers.
 - Require HTTPS by default.
 - Use `allowInsecure` only for local or in-cluster mock providers.
 - `allowInsecure` only permits `http://`; it must not disable TLS certificate verification for `https://` endpoints.
 - Reject `baseURL` values with URL userinfo or fragments.
 - Disable automatic redirects by default so an allowed provider endpoint cannot redirect the router to a different host.
-- Reject static headers that overwrite the configured auth header, `Host`,
-  `Content-Length`, or hop-by-hop headers.
+- Reject credential-bearing static headers, the configured auth header, `Host`, `Content-Length`, and hop-by-hop headers; static header values must be non-sensitive.
+- Validate the configured auth header against the same reserved-header rules.
+- Forward downstream headers through an explicit allowlist, strip client credentials and cookies, and inject provider credentials last.
+- Strip hop-by-hop response headers, and do not forward a stale `Content-Length` after streaming or body modification.
 - Keep provider, Secret, and ModelRoute references in the same namespace.
-- Consider reducing router Secret RBAC to `get/list/watch` if `create` is not
-  needed by other router features.
 
 ### Test Plan
 
@@ -609,15 +648,16 @@ Unit tests should not call real third-party APIs. Use `httptest.Server` and fake
 
 | Area | Coverage |
 |---|---|
-| API validation | `modelServerName` XOR `externalProviderRef`; HTTPS/`allowInsecure`; URL userinfo/query/fragment rejection; static header conflicts |
-| Secret resolution | missing Secret, missing key, valid key, rotation behavior, status conditions |
+| API validation | `modelServerName` XOR `externalProviderRef`; HTTPS/`allowInsecure`; URL userinfo/query/fragment rejection; credential/reserved static-header rejection; anonymous provider without `auth`; reject `secretRef.optional=true` when `auth` is present |
+| Request scope | text-only chat messages and string prompts; reject embeddings and multimodal content |
+| Secret resolution | missing Secret, missing key, valid key, rotation behavior, Secret add/update/delete event mapping, `ObservedGeneration`, `CredentialsResolved`, and `Ready` transitions |
 | Route resolution | external target, internal target, weighted internal/external split |
-| Request building | `/v1` prefix stripping, path join, raw body preservation, `UseNumber`, model rewrite, Bearer/Raw auth, static/request headers |
-| Streaming | SSE passthrough, line-by-line flush, usage callback, downstream cancellation, no mid-stream retry |
-| Non-streaming | body passthrough, usage parsing when present |
-| Errors | pass through upstream 4xx/5xx; create 502/504 for transport failures; retry only for constrained safe cases |
+| Request building | `/v1` prefix stripping, path join, raw body preservation, `UseNumber`, model rewrite, Bearer/Raw auth, reserved auth-header rejection, downstream header allowlist, credential precedence |
+| Streaming | SSE passthrough, line-by-line flush, usage callback, downstream cancellation, response header filtering, no mid-stream retry |
+| Non-streaming | body passthrough, usage parsing when present, response header filtering |
+| Errors | pass through every upstream non-2xx response with `upstream_response`/`upstream` attribution; create 502/504 with `upstream_transport`/`router` attribution; bounded access-log messages; no automatic provider retry |
 | Compatibility | existing ModelServer-only routes unchanged |
-| Observability | existing metrics get backend labels with default values for in-cluster traffic; no external-only metrics; controlled label values |
+| Observability | exact label schemas; ModelServer, matched LoRA adapter, provider, explicitly bound InferencePool, and unresolved values; buffered input tokens; consistent input/output attribution; balanced upstream gauges across retries and cancellation; no external-only metrics; controlled label values; e2e aggregation across matching series |
 
 E2E can use an in-cluster mock OpenAI-compatible server. This avoids depending on real external providers or free API availability.
 
@@ -627,7 +667,7 @@ E2E can use an in-cluster mock OpenAI-compatible server. This avoids depending o
 |---|---|---|
 | 1 | Confirm API shape with mentor/maintainers | Decision on Option B (recommended) vs A |
 | 2 | CRD types + codegen | `ExternalModelProvider` types, deepcopy, CRD YAML, client |
-| 3 | Registry + controller + store | Provider controller, store registry, informer wiring |
+| 3 | Registry + controller + store | Provider controller, store registry, provider/Secret informers, reverse Secret-reference index, status reconciliation and RBAC |
 | 4 | Route target refactor | `RouteTarget` + external branch in `doLoadbalance` |
 | 5 | Provider request + Secret + forwarding | `OpenAICompatibleProvider`, secret resolver, external forward |
 | 6 | Shared helpers | Extract `forwardResponse` + usage helper from Pod path |
@@ -637,6 +677,5 @@ E2E can use an in-cluster mock OpenAI-compatible server. This avoids depending o
 
 - Do maintainers accept Option B, or prefer Option A for lower implementation churn?
 - Is OpenAI-compatible-only scope acceptable for the first implementation?
-- Should `/v1/embeddings` remain fast-follow until `input` parsing is added?
 - Should the API reserve room for future cost-aware routing policies while keeping the first implementation limited to weighted target selection?
 - Is a mock OpenAI-compatible server acceptable for e2e?
