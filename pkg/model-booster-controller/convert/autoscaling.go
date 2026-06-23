@@ -26,6 +26,10 @@ import (
 
 func BuildAutoscalingPolicy(autoscalingConfig *workload.AutoscalingPolicySpec, model *workload.ModelBooster) *workload.AutoscalingPolicy {
 	spec := *autoscalingConfig
+	// ModelBooster derives the scaling target from the backend; ensure the generated policy is standalone-valid.
+	spec.HeterogeneousTarget = nil
+	spec.DisaggregatedTarget = nil
+
 	backend := model.Spec.Backend
 	targetName := utils.GetBackendResourceName(model.Name, backend.Name)
 	spec.HomogeneousTarget = &workload.HomogeneousTarget{

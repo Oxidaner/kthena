@@ -19,9 +19,9 @@ spec:
         kind: ModelServing
         name: autoscale-policy-lifecycle-ms
       metricSources:
-        sglang:token_usage:
+        sglang:kv_available_tokens:
           pod:
-            name: sglang:token_usage
+            name: sglang:kv_available_tokens
             port: 30000
             uri: /metrics
   behavior:

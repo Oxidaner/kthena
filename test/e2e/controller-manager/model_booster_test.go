@@ -117,6 +117,8 @@ func TestModelBoosterSelfHealing(t *testing.T) {
 		},
 	}
 
+	waitForWebhookReady(t, ctx, kthenaClient, model.Namespace)
+
 	createdModel, err := kthenaClient.WorkloadV1alpha1().ModelBoosters(testNamespace).Create(ctx, model, metav1.CreateOptions{})
 	require.NoError(t, err, "Failed to create Model CR")
 	assert.NotNil(t, createdModel)
