@@ -54,17 +54,17 @@ type MetricCollector struct {
 	promClientsMu  sync.Mutex
 }
 
-func NewMetricCollector(target *v1alpha1.Target, binding *v1alpha1.AutoscalingPolicyBinding, metricTargets map[string]float64) *MetricCollector {
+func NewMetricCollector(target *v1alpha1.Target, policy *v1alpha1.AutoscalingPolicy, metricTargets map[string]float64) *MetricCollector {
 	namespace := target.TargetRef.Namespace
 	if namespace == "" {
-		namespace = binding.Namespace
+		namespace = policy.Namespace
 	}
 	return &MetricCollector{
 		PastHistograms: datastructure.NewSnapshotSlidingWindow[map[string]HistogramInfo](util.SecondToTimestamp(util.SloQuantileSlidingWindowSeconds), util.SecondToTimestamp(util.SloQuantileDataKeepSeconds)),
 		Target:         target,
 		Scope: Scope{
-			Namespace:      namespace,
-			OwnedBindingId: binding.UID,
+			Namespace:     namespace,
+			OwnedPolicyId: policy.UID,
 		},
 		MetricTargets: metricTargets,
 		promClients:   make(map[string]promapi.Client),
@@ -77,13 +77,12 @@ type HistogramInfo struct {
 }
 
 type Scope struct {
-	Namespace      string
-	OwnedBindingId types.UID
+	Namespace     string
+	OwnedPolicyId types.UID
 }
 
 type Generations struct {
 	AutoscalePolicyGeneration int64
-	BindingGeneration         int64
 }
 
 func GetMetricTargets(autoscalePolicy *v1alpha1.AutoscalingPolicy) algorithm.Metrics {
@@ -156,18 +155,13 @@ func (collector *MetricCollector) planMetricSources(
 			klog.Warningf("metric source missing for metric %s in target %s", metricName, collector.Target.TargetRef.Name)
 			continue
 		}
-		sourceType := source.Type
-		if sourceType == "" {
-			sourceType = v1alpha1.PodMetricSourceType
-		}
-
-		switch sourceType {
-		case v1alpha1.PodMetricSourceType:
+		switch {
+		case source.Pod != nil:
 			addPodMetricToGroups(podGroups, metricName, source.Pod)
-		case v1alpha1.PrometheusMetricSourceType:
+		case source.Prometheus != nil:
 			collector.resolvePrometheusMetric(ctx, metricName, source.Prometheus, externalMetrics)
 		default:
-			klog.Warningf("unknown metric source type %q for metric %s", sourceType, metricName)
+			klog.Warningf("metric source backend config missing for metric %s", metricName)
 		}
 	}
 	return
