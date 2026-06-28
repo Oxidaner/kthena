@@ -25,11 +25,11 @@ graph LR
     E --> F["podIP:port"]
 ```
 
-This proposal adds a second upstream destination type: an external OpenAI-compatible provider such as OpenAI, DeepSeek, or any compatible gateway. Clients continue to call the Router's OpenAI-compatible `/v1/*` endpoints with a virtual model name; the Router decides whether the request goes to an in-cluster model or an external provider.
+This proposal adds a second upstream destination type for third-party providers. The LFX delivery scope covers both OpenAI-compatible providers such as OpenAI, DeepSeek, or compatible gateways, and Anthropic-compatible providers that expose the Messages API. Clients continue to call the Router with a virtual model name; the Router decides whether the request goes to an in-cluster model or an external provider.
 
 ```mermaid
 graph LR
-    C["Client (OpenAI-compatible /v1/*)"] --> R[Kthena Router]
+    C["Client (/v1/chat/completions, /v1/completions, /v1/messages)"] --> R[Kthena Router]
     R -->|in-cluster| MS["ModelServer → Pods"]
     R -->|external| EP["ExternalModelProvider → third-party API"]
 ```
@@ -42,6 +42,7 @@ The MVP endpoint scope is intentionally small:
 |---|---|---|
 | `/v1/chat/completions` | Supported | Text-only requests where `messages[].content` is a string |
 | `/v1/completions` | Supported | Text-only requests where `prompt` is a string |
+| `/v1/messages` | Supported | Anthropic-compatible Messages API, including streaming and non-streaming text requests |
 
 ### Motivation
 
@@ -71,16 +72,18 @@ External providers should therefore **skip Pod scheduling** and go directly thro
 ### Goals
 
 - Route text-only `/v1/chat/completions` and `/v1/completions` requests to an external OpenAI-compatible API.
+- Route text-only `/v1/messages` requests to an external Anthropic-compatible API.
 - Reference credentials through Kubernetes `Secret`s, never inline plaintext.
 - Reuse Router auth, rate limiting, access logging, metrics, model rewrite, and weighted traffic splitting.
-- Support streaming SSE passthrough for chat/completion requests.
+- Support streaming SSE passthrough for OpenAI chat/completion requests and Anthropic messages requests.
 - Preserve backward compatibility for existing `ModelRoute` and `ModelServer` manifests.
 - Provide unit tests, user docs, and examples. Mock-server e2e is a stretch goal.
 
 ### Non-Goals
 
-- Native Gemini, Anthropic, Bedrock, or Vertex request/response translation. (Note: Gemini and Cohere expose OpenAI-compatible endpoints — e.g. Gemini's `/v1beta/openai` prefix — so they work day-one via `baseURL` without a new adapter. Only their *native* formats are out of scope.)
-- Multimodal chat content such as `messages[].content` arrays.
+- Native Gemini, Bedrock, or Vertex request/response translation. (Note: Gemini and Cohere expose OpenAI-compatible endpoints — e.g. Gemini's `/v1beta/openai` prefix — so they work day-one via `baseURL` without a new adapter. Only their *native* formats are out of scope.)
+- OpenAI-to-Anthropic or Anthropic-to-OpenAI request translation. The MVP supports each protocol at its own Router endpoint and provider adapter; it does not translate one client protocol into another upstream protocol.
+- Multimodal content such as image, audio, or file content blocks. Text-only Anthropic content blocks are in scope.
 - Pod scheduling, KV-cache-aware routing, prefix-aware routing, LoRA affinity, or PD disaggregation for external providers.
 - LoRA routes targeting external providers. `ModelRoute.spec.loraAdapters[]` remains an in-cluster ModelServer feature in the MVP.
 - Managing the external service lifecycle.
@@ -131,25 +134,26 @@ graph TD
 
 | Field | Type | Required | Default | Notes |
 |---|---|---|---|---|
-| `providerType` | enum | no | `OpenAI` | Only `OpenAI` in MVP; it selects the OpenAI-compatible API adapter and does not restrict the upstream vendor |
+| `providerType` | enum | no | `OpenAI` | `OpenAI` or `Anthropic`; selects the protocol adapter. `OpenAI` means OpenAI-compatible, not only the OpenAI vendor |
 | `model` | string | no | — | Actual upstream model name; when set, overrides the request model like `ModelServer.spec.model`; when unset, preserves the request model |
 | `baseURL` | string | yes | — | `^https?://.+`; HTTPS unless `allowInsecure` |
 | `allowInsecure` | bool | no | `false` | Permits `http://` for local/mock providers |
 | `insecureSkipVerify` | bool | no | `false` | For HTTPS only, skips server certificate-chain and hostname verification; use only when the endpoint cannot present a certificate trusted by the Router |
-| `auth` | `ProviderAuth` | no | — | Credential Secret reference; its value is injected as `Authorization: Bearer <secret value>`; if unset, no auth header is injected |
+| `auth` | `ProviderAuth` | no | — | Credential Secret reference; the selected adapter injects it using the provider protocol's auth scheme; if unset, no auth header is injected |
 | `headers` | map | no | — | Non-sensitive static upstream headers; credentials must use `auth.secretRef` |
 
 `ProviderAuth` fields:
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `secretRef` | `corev1.SecretKeySelector` | — | `{name, key}`, same namespace; `optional` must be unset or `false`; the selected value is sent with Bearer authentication |
+| `secretRef` | `corev1.SecretKeySelector` | — | `{name, key}`, same namespace; `optional` must be unset or `false`; the selected value is sent with the adapter-specific authentication scheme |
 
 ```go
 type ExternalProviderType string
 
 const (
-    OpenAI ExternalProviderType = "OpenAI"
+    OpenAI    ExternalProviderType = "OpenAI"
+    Anthropic ExternalProviderType = "Anthropic"
 )
 
 // The BaseURL pattern limits the scheme to HTTP(S). These CEL rules require
@@ -157,9 +161,9 @@ const (
 // +kubebuilder:validation:XValidation:rule="self.allowInsecure || self.baseURL.startsWith('https://')",message="baseURL must be HTTPS unless allowInsecure is true"
 // +kubebuilder:validation:XValidation:rule="!self.insecureSkipVerify || self.baseURL.startsWith('https://')",message="insecureSkipVerify is only valid for HTTPS baseURL"
 type ExternalModelProviderSpec struct {
-    // MVP supports only the OpenAI-compatible API adapter.
+    // MVP supports OpenAI-compatible and Anthropic-compatible API adapters.
     // +optional
-    // +kubebuilder:validation:Enum=OpenAI
+    // +kubebuilder:validation:Enum=OpenAI;Anthropic
     // +kubebuilder:default=OpenAI
     ProviderType ExternalProviderType `json:"providerType,omitempty"`
 
@@ -188,13 +192,14 @@ type ExternalModelProviderSpec struct {
     // +kubebuilder:default=false
     InsecureSkipVerify bool `json:"insecureSkipVerify,omitempty"`
 
-    // Auth references a credential Secret in the same namespace.
+    // Auth references a credential Secret in the same namespace. The selected
+    // provider adapter decides how the value is injected into the upstream request.
     // +optional
     Auth *ProviderAuth `json:"auth,omitempty"`
 
     // Non-sensitive static headers added to upstream requests. Credentials must use
-    // Auth.SecretRef. Authorization, other credential-bearing headers, hop-by-hop
-    // headers, and request-routing headers such as Host and Content-Length are forbidden.
+    // Auth.SecretRef. Authorization, x-api-key, other credential-bearing headers,
+    // hop-by-hop headers, and request-routing headers such as Host and Content-Length are forbidden.
     // +optional
     Headers map[string]string `json:"headers,omitempty"`
 }
@@ -244,10 +249,11 @@ Validation:
 - `baseURL` must be parsed and must not contain URL userinfo, query, or
   fragment. This should be enforced by webhook validation because CEL is not a
   good fit for full URL parsing.
-- Static `headers` are for non-sensitive values only. Always reject credential-bearing headers such as `Authorization`, `Proxy-Authorization`, and `Cookie`, plus `Host`, `Content-Length`, and hop-by-hop headers. Header names must be validated case-insensitively, for example by canonicalizing with `http.CanonicalHeaderKey` or comparing with `strings.EqualFold` in webhook validation.
+- Static `headers` are for non-sensitive values only. Always reject credential-bearing headers such as `Authorization`, `Proxy-Authorization`, `Cookie`, and `x-api-key`, plus `Host`, `Content-Length`, and hop-by-hop headers. Header names must be validated case-insensitively, for example by canonicalizing with `http.CanonicalHeaderKey` or comparing with `strings.EqualFold` in webhook validation.
 - `auth` may be omitted for providers that require no credential. When `auth` is present, its Secret and key are mandatory; reject `secretRef.optional=true` rather than silently sending an unauthenticated request.
-- When `auth` is present, inject the selected Secret value as `Authorization: Bearer <secret value>`. The MVP does not support alternate credential headers or authentication schemes; future native provider adapters should define their own authentication behavior.
+- When `auth` is present, inject the selected Secret value according to the selected adapter: `Authorization: Bearer <secret value>` for OpenAI-compatible providers and `x-api-key: <secret value>` for Anthropic-compatible providers.
 - `secretRef.name` and `secretRef.key` are structurally validated at admission time. Secret existence and key availability are resolved asynchronously by the controller/router lister and reported through provider status.
+- The request protocol must match the selected external provider adapter. OpenAI-compatible endpoints route only to `providerType: OpenAI`; Anthropic-compatible `/v1/messages` routes only to `providerType: Anthropic`. The MVP does not translate between the two protocols.
 
 Example:
 
@@ -286,6 +292,47 @@ spec:
   - name: default
     targetModels:
     - externalModelProviderName: deepseek-provider
+```
+
+Anthropic-compatible provider example:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: anthropic-api-key
+  namespace: default
+type: Opaque
+stringData:
+  apiKey: "<redacted>"
+---
+apiVersion: networking.serving.volcano.sh/v1alpha1
+kind: ExternalModelProvider
+metadata:
+  name: anthropic-provider
+  namespace: default
+spec:
+  providerType: Anthropic
+  model: "<anthropic-model>"
+  baseURL: https://api.anthropic.com
+  auth:
+    secretRef:
+      name: anthropic-api-key
+      key: apiKey
+  headers:
+    anthropic-version: "2023-06-01"
+---
+apiVersion: networking.serving.volcano.sh/v1alpha1
+kind: ModelRoute
+metadata:
+  name: anthropic-route
+  namespace: default
+spec:
+  modelName: claude
+  rules:
+  - name: default
+    targetModels:
+    - externalModelProviderName: anthropic-provider
 ```
 
 Hybrid split also works:
@@ -334,24 +381,12 @@ spec:
 
 This is traffic splitting, not failure fallback. The MVP selects one target by weight at the beginning of the request; it does not automatically try the external provider after an in-cluster target fails, or vice versa.
 
-### Prior Art
-
-The A/B split mirrors a common pattern across existing LLM gateways:
-
-| Project | Type | How it models an external provider | Maps to |
-|---|---|---|---|
-| [Envoy AI Gateway](https://aigateway.envoyproxy.io/docs/concepts/resources) | K8s CRDs | Separate `AIServiceBackend` + `BackendSecurityPolicy` (credentials in their own resource, `secretRef` injected into `Authorization`) | Option B |
-| [LiteLLM Proxy](https://docs.litellm.ai/docs/proxy/configs) | Config file | One uniform `model_list[]` entry per model, self-hosted or external | Option A |
-| [Kong AI Gateway](https://developer.konghq.com/ai-gateway/) / [Higress AI Gateway](https://higress.ai/en/docs/latest/plugins/ai/api-provider/ai-proxy/) | Gateway plugin | Single `provider` block on the route/service | Option A |
-
-The takeaway: **CRD-native gateways lean toward separate resources (B); flat config/plugin proxies lean toward a unified entry (A).** Since Kthena is CRD-native, the closest precedent (Envoy AI Gateway) favors Option B. Its `secretRef`-into-`Authorization` credential model is also identical to this proposal's `auth.secretRef` + Bearer injection, and its pluggable `APISchema` validates the OpenAI-compatible-first MVP with adapters added later.
-
 ### Request Flow
 
 ```mermaid
 graph TD
-    C["Client<br/>POST /v1/chat/completions"] --> H[Router Handler]
-    H --> P[ParseModelRequest]
+    C["Client<br/>POST /v1/chat/completions, /v1/completions, or /v1/messages"] --> H[Router Handler]
+    H --> P[Parse request and model]
     P --> F[Auth / RateLimit / AccessLog / Metrics]
     F --> M[ModelRoute rule match]
     M --> W[Weighted target selection]
@@ -416,7 +451,8 @@ Add a small provider adapter layer under `pkg/kthena-router/provider/`.
 |---|---|
 | `provider.go` | `ProviderAdapter` interface + `Input` type |
 | `registry.go` | `providerType` → constructor lookup |
-| `openai.go` | `OpenAIProvider` implementing the OpenAI-compatible API adapter (MVP) |
+| `openai.go` | `OpenAIProvider` implementing the OpenAI-compatible API adapter |
+| `anthropic.go` | `AnthropicProvider` implementing the Anthropic-compatible Messages API adapter |
 | `secret.go` | Secret resolver (lister-backed) |
 | `transport.go` | Shared HTTP executor (`*http.Client`, timeouts, TLS, redirect policy, pooling) |
 
@@ -452,35 +488,69 @@ The adapter decides what the upstream request should look like: URL, model rewri
 
 The transport should keep separate long-lived secure and skip-verification clients, both created by cloning a private base `http.Transport`. The secure client uses normal certificate and hostname verification. The opt-in client uses a cloned `tls.Config` with `InsecureSkipVerify=true`. Never mutate `http.DefaultTransport`, a shared `tls.Config`, or the secure client when processing a provider with `insecureSkipVerify=true`; otherwise one provider could silently disable verification for every provider sharing the connection pool.
 
-The MVP provider only needs OpenAI-compatible passthrough:
+The MVP providers cover OpenAI-compatible passthrough and Anthropic-compatible Messages API passthrough. They share the same transport and Secret resolver but differ in URL mapping, authentication headers, streaming event semantics, and usage parsing.
+
+OpenAI-compatible adapter behavior:
 
 - Treat `baseURL` as the provider's OpenAI-compatible API root. Strip the public Router `/v1` prefix from the original path before joining. For example, `/v1/chat/completions` joined with `https://api.example.com/v1` becomes `https://api.example.com/v1/chat/completions`, and the same request joined with `https://generativelanguage.googleapis.com/v1beta/openai` becomes `https://generativelanguage.googleapis.com/v1beta/openai/chat/completions`.
 - If `auth` is configured, inject the selected Secret value as `Authorization: Bearer <secret value>`.
-- Do not copy downstream headers wholesale. Forward only `Content-Type`, `Accept`, and explicitly allowed tracing/request-correlation headers. Strip `Authorization`, `Proxy-Authorization`, `Cookie`, `Host`, `Content-Length`, and hop-by-hop headers; apply static headers and then inject the provider `Authorization` header last so client input cannot override it.
 - If `ExternalModelProvider.spec.model` is set, rewrite the request `model` to that value; otherwise preserve the request model. This matches the existing `ModelServer.spec.model` override behavior.
+
+Anthropic-compatible adapter behavior:
+
+- Accept Router requests on `/v1/messages` and forward them to the provider's Anthropic-compatible Messages API path under `baseURL`.
+- If `auth` is configured, inject the selected Secret value as `x-api-key: <secret value>`.
+- Forward or set required non-sensitive Anthropic protocol headers such as `anthropic-version` through the static header and downstream-header allowlist path. Credential-bearing headers still must come from `auth.secretRef`.
+- If `ExternalModelProvider.spec.model` is set, rewrite the Anthropic request `model` to that value; otherwise preserve the request model.
+- Parse Anthropic usage fields from non-streaming responses and streaming events. It must not use OpenAI-specific `stream_options.include_usage`.
+
+Common adapter behavior:
+
+- Do not copy downstream headers wholesale. Forward only `Content-Type`, `Accept`, protocol-required non-sensitive headers such as `anthropic-version`, and explicitly allowed tracing/request-correlation headers. Strip `Authorization`, `Proxy-Authorization`, `Cookie`, `x-api-key`, `Host`, `Content-Length`, and hop-by-hop headers; apply static headers and then inject the adapter-specific credential header last so client input cannot override it.
 - Use request context for cancellation.
 - Execute the request through the shared transport.
 
-Future provider adapters can convert native provider formats behind the same interface, but that is outside the MVP. This keeps the first change focused on making external OpenAI-compatible upstreams work end-to-end.
+The MVP should not translate between OpenAI and Anthropic request formats. An OpenAI-compatible client request is handled by the OpenAI adapter, and an Anthropic-compatible `/v1/messages` request is handled by the Anthropic adapter.
 
-#### Future Native Provider Support
+#### Provider Protocol Support
 
-The API should leave room for provider-specific adapters even though the first implementation only supports OpenAI-compatible passthrough. Native providers usually differ in request body, URL format, authentication, streaming format, and usage fields, so they should be handled in provider adapters instead of adding provider-specific checks throughout the router.
+The API should keep provider-specific behavior inside adapters. Native providers usually differ in request body, URL format, authentication, streaming format, and usage fields, so they should be handled in provider adapters instead of adding provider-specific checks throughout the router.
 
-| Future `providerType` | Why it may need an adapter |
+| `providerType` | Scope |
 |---|---|
-| `Anthropic` | Native Messages API request format, headers, streaming events, and usage fields differ from OpenAI |
-| `AzureOpenAI` | OpenAI-like request body, but deployment-based paths, API versions, and auth differ |
-| `AWSBedrock` | Service-specific signing/auth, model identifiers, and response envelopes differ |
-| `Custom` | User-controlled OpenAI-compatible or organization-specific gateway behavior |
+| `OpenAI` | MVP OpenAI-compatible chat/completions and completions passthrough |
+| `Anthropic` | MVP Anthropic-compatible Messages API (`/v1/messages`) passthrough |
+| `AzureOpenAI` | Future adapter; OpenAI-like request body, but deployment-based paths, API versions, and auth differ |
+| `AWSBedrock` | Future adapter; service-specific signing/auth, model identifiers, and response envelopes differ |
+| `Custom` | Future adapter; user-controlled OpenAI-compatible or organization-specific gateway behavior |
 
-This means the first implementation should add the provider registry and `providerType`, but only register `OpenAI` until routing, Secret handling, streaming, and observability are stable. Here, `OpenAI` identifies the OpenAI-compatible API adapter, so compatible services such as DeepSeek do not need separate provider types.
+Here, `OpenAI` identifies the OpenAI-compatible API adapter, so compatible services such as DeepSeek do not need separate provider types. `Anthropic` identifies the Anthropic-compatible Messages API adapter, so providers exposing that API can be added without changing `ModelRoute` or `ExternalModelProvider` references.
+
+#### Streaming Support
+
+Streaming should behave consistently for in-cluster and external targets. For OpenAI-compatible providers, if the downstream request contains `stream: true`, the provider path should forward the upstream SSE response line by line without buffering the full response. For Anthropic-compatible providers, `/v1/messages` streaming should forward Anthropic SSE events while parsing usage from Anthropic event payloads when available.
+
+The external path should:
+
+- Preserve `text/event-stream` behavior and flush chunks as they arrive.
+- Parse usage chunks when the provider returns them.
+- For OpenAI-compatible requests, follow the existing ModelServer path and inject usage options by default when needed for token accounting.
+- If Router injects OpenAI-compatible `stream_options.include_usage=true`, parse the usage chunk and suppress the injected usage-only chunk before forwarding. If the downstream request already asked for usage, forward the usage chunk.
+- For Anthropic-compatible requests, do not inject OpenAI-specific usage options; parse Anthropic-native usage fields and streaming events instead.
+- Record output tokens for rate limiting, access logs, and metrics when usage is available.
+- Continue forwarding the stream even if usage is absent.
+- For OpenAI-compatible chat/completions streams, forward `data: [DONE]` when the upstream sends it, and finish when the upstream response body reaches EOF.
+- For Anthropic-compatible messages streams, finish when the provider sends the terminal Anthropic message event and closes the response body.
+- Cancel the upstream request and exit the forwarding loop when the downstream client disconnects.
+- Never automatically retry the provider request, including after a stream has started.
+
+Streaming requests should follow the existing ModelServer path and must not use `http.Client.Timeout` as a total request timeout, because a valid model stream can last longer than a normal non-streaming request. Normal stream completion is upstream-driven: OpenAI-compatible chat/completions streams normally send `data: [DONE]` and then close the response body, while Anthropic-compatible streams send their own terminal event and close the response body. In both cases, the forwarding loop exits on EOF. The request context still handles downstream client disconnects and router shutdown. The external transport can add connection-stage bounds such as dial, TLS handshake, and response-header timeouts; `IdleConnTimeout` only controls pooled idle connections and is not an active stream-idle timeout. More specific first-token or active stream-idle timeout fields can be added later as explicit API decisions.
+
+The streaming copy and usage-parsing mechanics should be shared instead of implemented separately for providers. Status acceptance, retry, and fallback decisions remain path-specific and happen before response forwarding starts.
 
 #### Body and Usage Handling
 
-`ParseModelRequest()` consumes `c.Request.Body` today. The external path should
-read the body once, keep the raw bytes, and decode fields with
-`json.Decoder.UseNumber()`:
+`ParseModelRequest()` consumes `c.Request.Body` today for the OpenAI-compatible path. The external path should read the body once, keep the raw bytes, and decode protocol-specific fields with `json.Decoder.UseNumber()`:
 
 ```go
 type ParsedRequest struct {
@@ -489,7 +559,7 @@ type ParsedRequest struct {
 }
 ```
 
-The provider adapter should rebuild the JSON body only when it needs to rewrite `model` or add usage options. This preserves unknown provider-specific fields and avoids changing large JSON numbers into `float64` during passthrough.
+The provider adapter should rebuild the JSON body only when it needs to rewrite `model` or apply protocol-specific usage accounting options. This preserves unknown provider-specific fields and avoids changing large JSON numbers into `float64` during passthrough.
 
 Streaming usage handling should be shared with the existing Pod path. Today this logic lives in unexported connector code (`addTokenUsage`), so implementation should move it into a shared helper, for example:
 
@@ -497,25 +567,9 @@ Streaming usage handling should be shared with the existing Pod path. Today this
 applyUsageOpts(c, modelRequest, backendType)
 ```
 
-For streaming, keep the standard OpenAI-compatible `stream_options.include_usage=true`. Match the current Pod path semantics: if the downstream request already asked for `stream_options.include_usage=true`, forward the provider's usage chunk to the client; if the Router injects `include_usage=true` only for internal accounting, parse that usage chunk and suppress the injected usage-only chunk before forwarding. For non-streaming external calls, avoid injecting non-standard top-level fields unless a provider explicitly supports it.
+For OpenAI-compatible requests, follow the existing ModelServer behavior. If the downstream streaming request already asks for `stream_options.include_usage=true`, forward the provider's usage chunk to the client and also use it for internal accounting. If the downstream streaming request does not ask for usage, Router may inject `stream_options.include_usage=true` upstream for token accounting, parse the usage chunk, and suppress the injected usage-only chunk before forwarding so the downstream response shape stays unchanged. For non-streaming OpenAI-compatible requests, keep the current internal-path behavior and add `include_usage=true` when building the upstream request.
 
-#### Streaming Support
-
-Streaming should behave the same for in-cluster and external targets. For OpenAI-compatible providers, if the downstream request contains `stream: true`, the provider path should forward the upstream SSE response line by line without buffering the full response.
-
-The external path should:
-
-- Preserve `text/event-stream` behavior and flush chunks as they arrive.
-- Parse usage chunks when the provider returns them.
-- Record output tokens for rate limiting, access logs, and metrics when usage is available.
-- Continue forwarding the stream even if usage is absent.
-- For OpenAI-compatible chat/completions streams, forward `data: [DONE]` when the upstream sends it, and finish when the upstream response body reaches EOF.
-- Cancel the upstream request and exit the forwarding loop when the downstream client disconnects.
-- Never automatically retry the provider request, including after a stream has started.
-
-Streaming requests should follow the existing ModelServer path and must not use `http.Client.Timeout` as a total request timeout, because a valid model stream can last longer than a normal non-streaming request. Normal stream completion is upstream-driven: OpenAI-compatible chat/completions streams normally send `data: [DONE]` and then close the response body, so the forwarding loop exits on EOF. The request context still handles downstream client disconnects and router shutdown. The external transport can add connection-stage bounds such as dial, TLS handshake, and response-header timeouts; `IdleConnTimeout` only controls pooled idle connections and is not an active stream-idle timeout. More specific first-token or active stream-idle timeout fields can be added later as explicit API decisions.
-
-The streaming copy and usage-parsing mechanics should be shared instead of implemented separately for providers. Status acceptance, retry, and fallback decisions remain path-specific and happen before response forwarding starts.
+For Anthropic-compatible requests, do not inject OpenAI-specific usage fields. The Anthropic adapter should parse usage from the Anthropic response body and streaming events.
 
 #### Response Forwarding
 
@@ -661,15 +715,15 @@ Unit tests should not call real third-party APIs. Use `httptest.Server` and fake
 | Area | Coverage |
 |---|---|
 | API validation | `modelServerName` XOR `externalModelProviderName`; reject `externalModelProviderName` on routes with `loraAdapters[]`; optional provider `model` length; HTTPS/`allowInsecure`; reject `insecureSkipVerify` for HTTP; URL userinfo/query/fragment rejection; credential/reserved static-header rejection; anonymous provider without `auth`; reject `secretRef.optional=true` when `auth` is present |
-| Request scope | text-only chat messages and string prompts; reject multimodal content |
+| Request scope | OpenAI text-only chat messages and string prompts; Anthropic text-only messages requests; reject multimodal content |
 | Secret resolution | missing Secret, missing key, valid key, rotation behavior, Secret add/update/delete event mapping, `ObservedGeneration`, `CredentialsResolved`, and `Ready` transitions |
-| Route resolution | external target, internal target, weighted internal/external split, LoRA route remains ModelServer-only |
-| Request building | `/v1` prefix stripping, path join, raw body preservation, `UseNumber`, configured model override and unset-model passthrough, fixed Bearer auth, reserved `Authorization` static-header rejection, downstream header allowlist, credential precedence |
+| Route resolution | external target, internal target, weighted internal/external split, LoRA route remains ModelServer-only, request protocol matches selected provider type |
+| Request building | OpenAI and Anthropic path joining, raw body preservation, `UseNumber`, configured model override and unset-model passthrough, adapter-specific auth headers, reserved credential static-header rejection, downstream header allowlist, credential precedence |
 | TLS | trusted certificate succeeds by default; self-signed certificate fails by default; the same self-signed endpoint succeeds only with `insecureSkipVerify=true`; enabling it for HTTP is rejected; secure and skip-verification connection pools remain isolated |
-| Streaming | SSE passthrough, line-by-line flush, usage callback, suppression of Router-injected usage-only chunks, downstream-requested usage chunks still forwarded, `[DONE]` forwarding, EOF completion, downstream cancellation, response header filtering, no mid-stream retry |
+| Streaming | SSE passthrough, line-by-line flush, usage callback, OpenAI-compatible default usage-option injection aligned with the existing ModelServer path, downstream-requested usage chunks forwarded, Router-injected usage-only chunks suppressed, Anthropic-native streaming events and usage parsing, `[DONE]` or Anthropic terminal event handling, EOF completion, downstream cancellation, response header filtering, no mid-stream retry |
 | Non-streaming | body passthrough, usage parsing when present, response header filtering |
 | Errors | pass through every upstream non-2xx response with `upstream_response`/`upstream` attribution; create 502/504 with `upstream_transport`/`router` attribution; bounded access-log messages; no automatic provider retry |
 | Compatibility | existing ModelServer-only routes unchanged |
 | Observability | exact label schemas; ModelServer, matched LoRA adapter, provider, explicitly bound InferencePool, and unresolved values; buffered input tokens; consistent input/output attribution; balanced upstream gauges across retries and cancellation; no external-only metrics; controlled label values; e2e aggregation across matching series |
 
-E2E can use an in-cluster mock OpenAI-compatible server. This avoids depending on real external providers or free API availability.
+E2E can use in-cluster mock OpenAI-compatible and Anthropic-compatible servers. This avoids depending on real external providers or free API availability.
