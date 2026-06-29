@@ -136,8 +136,7 @@ graph TD
 |---|---|---|---|---|
 | `providerType` | enum | no | `OpenAI` | `OpenAI` or `Anthropic`; selects the protocol adapter. `OpenAI` means OpenAI-compatible, not only the OpenAI vendor |
 | `model` | string | no | — | Actual upstream model name; when set, overrides the request model like `ModelServer.spec.model`; when unset, preserves the request model |
-| `baseURL` | string | yes | — | `^https?://.+`; HTTPS unless `allowInsecure` |
-| `allowInsecure` | bool | no | `false` | Permits `http://` for local/mock providers |
+| `baseURL` | string | yes | — | `^https://.+`; external providers must use HTTPS |
 | `insecureSkipVerify` | bool | no | `false` | For HTTPS only, skips server certificate-chain and hostname verification; use only when the endpoint cannot present a certificate trusted by the Router |
 | `auth` | `ProviderAuth` | no | — | Credential Secret reference; the selected adapter injects it using the provider protocol's auth scheme; if unset, no auth header is injected |
 | `headers` | map | no | — | Non-sensitive static upstream headers; credentials must use `auth.secretRef` |
@@ -156,10 +155,8 @@ const (
     Anthropic ExternalProviderType = "Anthropic"
 )
 
-// The BaseURL pattern limits the scheme to HTTP(S). These CEL rules require
-// HTTPS unless HTTP is explicitly enabled and restrict InsecureSkipVerify to HTTPS.
-// +kubebuilder:validation:XValidation:rule="self.allowInsecure || self.baseURL.startsWith('https://')",message="baseURL must be HTTPS unless allowInsecure is true"
-// +kubebuilder:validation:XValidation:rule="!self.insecureSkipVerify || self.baseURL.startsWith('https://')",message="insecureSkipVerify is only valid for HTTPS baseURL"
+// The BaseURL pattern requires HTTPS. These external providers run outside the
+// cluster boundary, so plain HTTP is not supported.
 type ExternalModelProviderSpec struct {
     // MVP supports OpenAI-compatible and Anthropic-compatible API adapters.
     // +optional
@@ -173,18 +170,12 @@ type ExternalModelProviderSpec struct {
     // +kubebuilder:validation:MaxLength=256
     Model *string `json:"model,omitempty"`
 
-    // BaseURL is the provider endpoint root. The pattern allows only HTTP(S);
-    // the struct-level CEL rule controls whether HTTP is permitted.
+    // BaseURL is the provider endpoint root. External providers must use HTTPS.
     // Example: https://api.deepseek.com
     // +kubebuilder:validation:Required
     // +kubebuilder:validation:MinLength=1
-    // +kubebuilder:validation:Pattern=^https?://.+
+    // +kubebuilder:validation:Pattern=^https://.+
     BaseURL string `json:"baseURL"`
-
-    // AllowInsecure permits http:// only for local/in-cluster mock providers.
-    // +optional
-    // +kubebuilder:default=false
-    AllowInsecure bool `json:"allowInsecure,omitempty"`
 
     // InsecureSkipVerify disables server certificate-chain and hostname
     // verification for HTTPS. It does not enable plain HTTP.
@@ -244,7 +235,7 @@ Validation:
 
 - Exactly one of `modelServerName` and `externalModelProviderName` must be set.
 - If `ModelRoute.spec.loraAdapters[]` is non-empty, every `targetModels[]` entry must use `modelServerName`; `externalModelProviderName` is rejected for that route. OpenAI-compatible passthrough has no standard way to express a Kthena LoRA adapter to an arbitrary provider.
-- `baseURL` must be HTTPS unless `allowInsecure=true`.
+- `baseURL` must be HTTPS. Plain HTTP is not supported for external providers.
 - `insecureSkipVerify` is valid only with an HTTPS `baseURL`. It leaves the connection encrypted but disables certificate-chain and hostname verification.
 - `baseURL` must be parsed and must not contain URL userinfo, query, or
   fragment. This should be enforced by webhook validation because CEL is not a
@@ -698,8 +689,6 @@ This proposal intentionally does not implement cost-aware routing in the first v
 - Restrict ExternalModelProvider create/update permissions to trusted administrators or tenants that are explicitly allowed to select Router egress destinations. In multi-tenant installations, enforce the allowed destinations with Router egress NetworkPolicy, a proxy, or an environment-specific admission policy.
 - Never log Secret contents or upstream auth headers.
 - Require HTTPS by default.
-- Use `allowInsecure` only for local or in-cluster mock providers.
-- `allowInsecure` only permits `http://`; it does not change HTTPS certificate verification.
 - `insecureSkipVerify` applies only to HTTPS and disables both certificate-chain and hostname verification. Restrict its use to trusted provider configuration where the endpoint cannot present a certificate trusted by the Router; prefer adding the organization CA to the Router trust store because skip-verification permits man-in-the-middle attacks.
 - Reject `baseURL` values with URL userinfo, query, or fragments.
 - Disable automatic redirects by default so an allowed provider endpoint cannot redirect the router to a different host.
@@ -714,16 +703,16 @@ Unit tests should not call real third-party APIs. Use `httptest.Server` and fake
 
 | Area | Coverage |
 |---|---|
-| API validation | `modelServerName` XOR `externalModelProviderName`; reject `externalModelProviderName` on routes with `loraAdapters[]`; optional provider `model` length; HTTPS/`allowInsecure`; reject `insecureSkipVerify` for HTTP; URL userinfo/query/fragment rejection; credential/reserved static-header rejection; anonymous provider without `auth`; reject `secretRef.optional=true` when `auth` is present |
+| API validation | `modelServerName` XOR `externalModelProviderName`; reject `externalModelProviderName` on routes with `loraAdapters[]`; optional provider `model` length; require HTTPS `baseURL`; URL userinfo/query/fragment rejection; credential/reserved static-header rejection; anonymous provider without `auth`; reject `secretRef.optional=true` when `auth` is present |
 | Request scope | OpenAI text-only chat messages and string prompts; Anthropic text-only messages requests; reject multimodal content |
 | Secret resolution | missing Secret, missing key, valid key, rotation behavior, Secret add/update/delete event mapping, `ObservedGeneration`, `CredentialsResolved`, and `Ready` transitions |
 | Route resolution | external target, internal target, weighted internal/external split, LoRA route remains ModelServer-only, request protocol matches selected provider type |
 | Request building | OpenAI and Anthropic path joining, raw body preservation, `UseNumber`, configured model override and unset-model passthrough, adapter-specific auth headers, reserved credential static-header rejection, downstream header allowlist, credential precedence |
-| TLS | trusted certificate succeeds by default; self-signed certificate fails by default; the same self-signed endpoint succeeds only with `insecureSkipVerify=true`; enabling it for HTTP is rejected; secure and skip-verification connection pools remain isolated |
+| TLS | trusted certificate succeeds by default; self-signed certificate fails by default; the same self-signed endpoint succeeds only with `insecureSkipVerify=true`; plain HTTP `baseURL` is rejected; secure and skip-verification connection pools remain isolated |
 | Streaming | SSE passthrough, line-by-line flush, usage callback, OpenAI-compatible default usage-option injection aligned with the existing ModelServer path, downstream-requested usage chunks forwarded, Router-injected usage-only chunks suppressed, Anthropic-native streaming events and usage parsing, `[DONE]` or Anthropic terminal event handling, EOF completion, downstream cancellation, response header filtering, no mid-stream retry |
 | Non-streaming | body passthrough, usage parsing when present, response header filtering |
 | Errors | pass through every upstream non-2xx response with `upstream_response`/`upstream` attribution; create 502/504 with `upstream_transport`/`router` attribution; bounded access-log messages; no automatic provider retry |
 | Compatibility | existing ModelServer-only routes unchanged |
 | Observability | exact label schemas; ModelServer, matched LoRA adapter, provider, explicitly bound InferencePool, and unresolved values; buffered input tokens; consistent input/output attribution; balanced upstream gauges across retries and cancellation; no external-only metrics; controlled label values; e2e aggregation across matching series |
 
-E2E can use in-cluster mock OpenAI-compatible and Anthropic-compatible servers. This avoids depending on real external providers or free API availability.
+E2E can use in-cluster HTTPS mock OpenAI-compatible and Anthropic-compatible servers with self-signed certificates and `insecureSkipVerify=true` where needed. This avoids depending on real external providers or free API availability while still exercising the HTTPS-only provider path.
